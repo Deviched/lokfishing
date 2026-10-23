@@ -1,0 +1,8 @@
+{
+  "author": ["Sahae"],
+  "name": "LokFishing",
+  "short": "Legend of Korra-inspired fishing mini game",
+  "description": "A button-driven fishing mini game with persistent fish inventories.",
+  "install_msg": "Use [p]lokfish to open the fishing menu.",
+  "tags": ["game", "fishing"]
+}

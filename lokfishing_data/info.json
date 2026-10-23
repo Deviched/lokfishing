@@ -1,0 +1,10 @@
+{
+  "author": ["ClaudeAI"],
+  "description": "A Legend of Korra-inspired fishing mini game.",
+  "short": "Button-driven fishing at three locations, with persistent fish inventories.",
+  "end_user_data_statement": "This cog stores each player's fish inventory and amount caught in Redbot's persistent Config system.",
+  "install_msg": "Use [p]lokfish to open the fishing menu. See the cog documentation for image filenames and admin commands.",
+  "requirements": ["Pillow"],
+  "tags": ["game", "fishing"],
+  "type": "COG"
+}
