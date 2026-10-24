@@ -19,13 +19,11 @@ from .dashboard import DEFAULT_COLLECTION_PROMPT, FishingDashboard
 log = logging.getLogger("red.lokfishing")
 
 AVATAR_DIR = Path("/home/cogs/lokfishing/avatars")
-
 ULTRARARE_THRESHOLD_PERCENT = 5.0
-MAX_FISH_DESCRIPTION_LENGTH = 1000
 MAX_MENU_LOCATIONS = 25
-
-RARITIES = {"common", "rare"}
+MAX_FISH_DESCRIPTION_LENGTH = 1000
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
+RARITIES = {"common", "rare"}
 
 
 def fish_slug(name: str) -> str:
@@ -43,22 +41,36 @@ def is_nothing(entry: dict) -> bool:
     )
 
 
-def load_default_locations() -> dict:
-    """Load and validate default drop tables from the adjacent JSON file."""
-    table_path = Path(__file__).with_name("loot_tables.json")
+def load_default_data():
+    """Load the bundled location tables and independent fish catalog."""
+    path = Path(__file__).with_name("loot_tables.json")
 
     try:
-        with table_path.open("r", encoding="utf-8") as table_file:
-            locations = json.load(table_file)
+        with path.open("r", encoding="utf-8") as data_file:
+            raw = json.load(data_file)
     except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(
-            f"Could not load fishing tables from {table_path}: {exc}"
-        ) from exc
+        raise RuntimeError(f"Could not load {path}: {exc}") from exc
+
+    # Also accept the older format where the JSON root was the locations map.
+    if isinstance(raw, dict) and "locations" in raw:
+        locations = raw["locations"]
+        catalog = raw.get("fish_catalog", [])
+    else:
+        locations = raw
+        catalog = []
 
     if not isinstance(locations, dict) or not locations:
-        raise RuntimeError(
-            f"{table_path} must contain a non-empty JSON object."
-        )
+        raise RuntimeError("loot_tables.json must contain non-empty locations.")
+    if not isinstance(catalog, list):
+        raise RuntimeError("fish_catalog must be a list of fish names.")
+
+    cleaned_catalog = []
+    seen_catalog = set()
+    for item in catalog:
+        name = str(item).strip()
+        if name and name.casefold() not in seen_catalog:
+            cleaned_catalog.append(name)
+            seen_catalog.add(name.casefold())
 
     for key, location in locations.items():
         if not isinstance(key, str) or not re.fullmatch(r"[a-z0-9_]+", key):
@@ -66,19 +78,15 @@ def load_default_locations() -> dict:
         if not isinstance(location, dict):
             raise RuntimeError(f"Location {key!r} must be an object.")
         if not isinstance(location.get("label"), str) or not location["label"].strip():
-            raise RuntimeError(f"Location {key!r} needs a non-empty label.")
+            raise RuntimeError(f"Location {key!r} needs a label.")
 
         try:
-            rare_chance = float(location["rare_chance"])
+            chance = float(location["rare_chance"])
         except (KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError(
-                f"Location {key!r} needs a valid rare_chance."
-            ) from exc
+            raise RuntimeError(f"Location {key!r} needs rare_chance.") from exc
 
-        if not math.isfinite(rare_chance) or not 0 <= rare_chance <= 100:
-            raise RuntimeError(
-                f"Location {key!r} rare_chance must be between 0 and 100."
-            )
+        if not math.isfinite(chance) or not 0 <= chance <= 100:
+            raise RuntimeError(f"Invalid rare_chance for {key!r}.")
 
         for rarity in RARITIES:
             table = location.get(rarity)
@@ -86,47 +94,34 @@ def load_default_locations() -> dict:
                 raise RuntimeError(
                     f"Location {key!r} needs a non-empty {rarity} table."
                 )
-
             for entry in table:
-                if not isinstance(entry, dict):
-                    raise RuntimeError(
-                        f"Location {key!r} has an invalid {rarity} entry."
-                    )
-                if not isinstance(entry.get("name"), str) or not entry["name"].strip():
-                    raise RuntimeError(
-                        f"Location {key!r} has an entry without a name."
-                    )
-
+                if not isinstance(entry, dict) or not str(entry.get("name", "")).strip():
+                    raise RuntimeError(f"Invalid entry in {key!r}/{rarity}.")
                 try:
                     weight = float(entry.get("weight", 0))
                 except (TypeError, ValueError) as exc:
-                    raise RuntimeError(
-                        f"Location {key!r} has an invalid weight."
-                    ) from exc
-
+                    raise RuntimeError("Invalid table weight.") from exc
                 if not math.isfinite(weight) or weight <= 0:
-                    raise RuntimeError(
-                        f"Location {key!r} weights must be positive."
-                    )
+                    raise RuntimeError("Table weights must be positive.")
 
-    return locations
+    return locations, cleaned_catalog
 
 
-DEFAULT_LOCATIONS = load_default_locations()
+DEFAULT_LOCATIONS, DEFAULT_FISH_CATALOG = load_default_data()
 
 
 class LocationButton(discord.ui.Button):
-    def __init__(self, cog, location_key: str, label: str):
+    def __init__(self, cog, key: str, label: str):
         super().__init__(
             label=label,
             style=discord.ButtonStyle.primary,
-            custom_id=f"lokfishing:{location_key}",
+            custom_id=f"lokfishing:{key}",
         )
         self.cog = cog
-        self.location_key = location_key
+        self.key = key
 
     async def callback(self, interaction: discord.Interaction):
-        await self.cog.handle_catch(interaction, self.location_key)
+        await self.cog.handle_catch(interaction, self.key)
 
 
 class FishingMenu(discord.ui.View):
@@ -135,13 +130,7 @@ class FishingMenu(discord.ui.View):
         self.message = None
 
         for key, location in list(locations.items())[:MAX_MENU_LOCATIONS]:
-            self.add_item(
-                LocationButton(
-                    cog=cog,
-                    location_key=key,
-                    label=location["label"],
-                )
-            )
+            self.add_item(LocationButton(cog, key, location["label"]))
 
     async def on_timeout(self):
         for item in self.children:
@@ -159,9 +148,7 @@ class FishingMenu(discord.ui.View):
 
 
 class LokFishing(commands.Cog):
-    """Button-driven fishing game with bait, collections, and dashboard."""
-
-    default_locations = DEFAULT_LOCATIONS
+    """Fishing game with global collections, bait, and local dashboard."""
 
     def __init__(self, bot):
         self.bot = bot
@@ -172,84 +159,91 @@ class LokFishing(commands.Cog):
         )
         self.config.register_global(
             locations=DEFAULT_LOCATIONS,
-            cooldown_seconds=30,
-            casts_per_bait=6,
-            bait_cooldown_seconds=30,
+            fish_catalog=DEFAULT_FISH_CATALOG,
             fish_descriptions={},
             collections={},
+            casts_per_bait=6,
+            bait_cooldown_seconds=30,
+            cooldown_seconds=30,
         )
         self.config.register_user(
             inventory={},
-            completed_collections={},
             bait_state={},
+            completed_collections={},
         )
 
-        self._last_catch = {}
         self._state_lock = asyncio.Lock()
         self._dashboard = None
 
-    async def _ensure_default_collections(self):
-        """Create an initial common-fish collection for locations lacking one."""
+    async def add_catalog_names(self, names):
+        """Add fish names to the dashboard catalog without adding drop entries."""
+        async with self._state_lock:
+            current = list(await self.config.fish_catalog())
+            seen = {str(name).casefold() for name in current}
+
+            for raw_name in names:
+                name = str(raw_name).strip()
+                if name and name.casefold() not in seen:
+                    current.append(name)
+                    seen.add(name.casefold())
+
+            await self.config.fish_catalog.set(current)
+
+    async def _migrate_old_collections(self):
+        """Convert old location-shaped collection settings to global sets."""
         async with self._state_lock:
             locations = await self.config.locations()
             collections = await self.config.collections()
             changed = False
 
-            for key, location in locations.items():
-                if key in collections:
+            for key, value in list(collections.items()):
+                if not isinstance(value, dict) or "name" in value:
+                    continue
+                if "fish" not in value:
                     continue
 
-                fish = []
-                seen = set()
+                label = locations.get(key, {}).get("label", key.replace("_", " ").title())
+                new_key = f"legacy_{key}"
+                suffix = 2
+                while new_key in collections and new_key != key:
+                    new_key = f"legacy_{key}_{suffix}"
+                    suffix += 1
 
-                for entry in location.get("common", []):
-                    if not isinstance(entry, dict) or is_nothing(entry):
-                        continue
-
-                    name = str(entry.get("name", "")).strip()
-                    if name and name.casefold() not in seen:
-                        fish.append(name)
-                        seen.add(name.casefold())
-
-                collections[key] = {
-                    "enabled": bool(fish),
-                    "fish": fish,
-                    "prompt": DEFAULT_COLLECTION_PROMPT,
+                collections[new_key] = {
+                    "name": f"{label} Collection",
+                    "enabled": bool(value.get("enabled", True)),
+                    "fish": list(value.get("fish", [])),
+                    "prompt": str(value.get("prompt", DEFAULT_COLLECTION_PROMPT)),
                 }
+                del collections[key]
                 changed = True
 
             if changed:
                 await self.config.collections.set(collections)
 
+    async def _seed_catalog(self):
+        await self.add_catalog_names(DEFAULT_FISH_CATALOG)
+
     async def cog_load(self):
-        await self._ensure_default_collections()
+        await self._migrate_old_collections()
+        await self._seed_catalog()
 
         password = os.getenv("LOKFISHING_DASHBOARD_PASSWORD")
         if not password:
-            log.info(
-                "LokFishing dashboard disabled: "
-                "LOKFISHING_DASHBOARD_PASSWORD is not set."
-            )
+            log.info("LokFishing dashboard disabled: password is not configured.")
             return
-
         if len(password) < 24:
-            log.error(
-                "LokFishing dashboard disabled: password must be at least "
-                "24 characters long."
-            )
+            log.error("Dashboard password must be at least 24 characters.")
             return
 
         try:
             port = int(os.getenv("LOKFISHING_DASHBOARD_PORT", "8788"))
-            if not 1 <= port <= 65535:
-                raise ValueError("Dashboard port must be between 1 and 65535.")
-
             self._dashboard = FishingDashboard(self, password, port)
             await self._dashboard.start()
             log.info("LokFishing dashboard started on port %s.", port)
         except Exception:
             self._dashboard = None
-            log.exception("Could not start the LokFishing dashboard.")
+            log.exception("Could not start LokFishing dashboard.")
 
     async def cog_unload(self):
         if self._dashboard is not None:
@@ -260,83 +254,55 @@ class LokFishing(commands.Cog):
     async def lokfish(self, ctx):
         """Open the fishing location menu."""
         locations = await self.config.locations()
-
         if not locations:
             await ctx.send("No fishing locations are configured.")
             return
 
         view = FishingMenu(self, locations)
         message = await ctx.send(
-            "**Legend of Korra Fishing**\n"
-            "Choose a location to cast your line:",
+            "**Legend of Korra Fishing**\nChoose a location to cast your line:",
             view=view,
         )
         view.message = message
 
-        if len(locations) > MAX_MENU_LOCATIONS:
-            await ctx.send(
-                f"Only the first {MAX_MENU_LOCATIONS} locations fit in the menu."
-            )
-
     @staticmethod
-    def _validated_table(location: dict, rarity: str):
+    def _validated_table(location, rarity):
         table = location.get(rarity)
         if not isinstance(table, list) or not table:
             raise ValueError(f"The {rarity} table is empty or invalid.")
 
         weights = []
         for entry in table:
-            if not isinstance(entry, dict):
-                raise ValueError(f"The {rarity} table has an invalid entry.")
-
-            name = entry.get("name")
-            if not isinstance(name, str) or not name.strip():
-                raise ValueError(f"The {rarity} table has an entry without a name.")
-
+            if not isinstance(entry, dict) or not str(entry.get("name", "")).strip():
+                raise ValueError(f"The {rarity} table contains an invalid entry.")
             weight = float(entry.get("weight", 0))
             if not math.isfinite(weight) or weight <= 0:
-                raise ValueError(f"The {rarity} table has an invalid weight.")
-
+                raise ValueError(f"The {rarity} table contains an invalid weight.")
             weights.append(weight)
 
         return table, weights
 
-    def _fish_chance_percent(
-        self,
-        location: dict,
-        rare_chance: float,
-        fish_name: str,
-    ) -> float:
-        total = 0.0
-        branch_chances = {
-            "common": 100.0 - rare_chance,
-            "rare": rare_chance,
-        }
-
-        for rarity, branch_chance in branch_chances.items():
+    def _fish_chance_percent(self, location, rare_chance, fish_name):
+        result = 0.0
+        for rarity, branch_chance in (
+            ("common", 100.0 - rare_chance),
+            ("rare", rare_chance),
+        ):
             if branch_chance <= 0:
                 continue
 
             table, weights = self._validated_table(location, rarity)
-            table_total = sum(weights)
-
+            total = sum(weights)
             for entry, weight in zip(table, weights):
                 if (
                     not is_nothing(entry)
-                    and entry["name"].strip().casefold()
-                    == fish_name.strip().casefold()
+                    and entry["name"].casefold() == fish_name.casefold()
                 ):
-                    total += branch_chance * weight / table_total
+                    result += branch_chance * weight / total
 
-        return min(total, 100.0)
+        return min(result, 100.0)
 
-    async def _record_new_collection_completions(
-        self,
-        user,
-        inventory: dict,
-        locations: dict,
-    ) -> list:
-        """Save newly completed collection versions and return their prompts."""
+    async def _newly_completed_collections(self, user, inventory):
         collections = await self.config.collections()
         user_config = self.config.user(user)
         completed = await user_config.completed_collections()
@@ -346,8 +312,8 @@ class LokFishing(commands.Cog):
 
         owned = {
             str(name).casefold()
-            for name, amount in inventory.items()
-            if int(amount) > 0
+            for name, count in inventory.items()
+            if int(count) > 0
         }
 
         prompts = []
@@ -361,22 +327,17 @@ class LokFishing(commands.Cog):
             if not isinstance(required, list) or not required:
                 continue
 
-            normalized = sorted(
-                {
-                    str(name).strip().casefold()
-                    for name in required
-                    if str(name).strip()
-                }
-            )
-            if not normalized or not all(name in owned for name in normalized):
+            required_keys = sorted({
+                str(name).strip().casefold()
+                for name in required
+                if str(name).strip()
+            })
+            if not required_keys or not all(name in owned for name in required_keys):
                 continue
 
-            signature_data = json.dumps(
-                normalized,
-                ensure_ascii=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-            signature = hashlib.sha256(signature_data).hexdigest()
+            signature = hashlib.sha256(
+                json.dumps(required_keys, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
 
             if completed.get(key) == signature:
                 continue
@@ -384,16 +345,14 @@ class LokFishing(commands.Cog):
             completed[key] = signature
             changed = True
 
-            location_label = locations.get(key, {}).get("label", key)
-            collection_label = f"{location_label} Common Fish"
+            collection_name = str(collection.get("name", key))
             prompt = str(collection.get("prompt", "")).strip()
             if not prompt:
                 prompt = DEFAULT_COLLECTION_PROMPT
 
             prompt = (
                 prompt.replace("{user}", user.display_name)
-                .replace("{collection}", collection_label)
-                .replace("{location}", location_label)
+                .replace("{collection}", collection_name)
             )
             prompts.append(prompt[:1900])
 
@@ -402,28 +361,22 @@ class LokFishing(commands.Cog):
 
         return prompts
 
-    async def handle_catch(self, interaction: discord.Interaction, location_key: str):
+    async def handle_catch(self, interaction, location_key):
         if interaction.user.bot:
-            await interaction.response.send_message(
-                "Bots can't fish.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("Bots can't fish.", ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=True)
 
-        user_id = interaction.user.id
-        current_time = time.time()
-
         cooldown_message = None
         config_error = False
-        missing_location = False
         no_catch = False
-        rarity = None
+        location_missing = False
         fish_name = None
         fish_description = ""
+        rarity = None
         amount = 0
-        fish_chance_percent = None
+        fish_chance = None
         location = None
         bait_status = ""
         completion_prompts = []
@@ -433,53 +386,42 @@ class LokFishing(commands.Cog):
             location = locations.get(location_key)
 
             if location is None:
-                missing_location = True
+                location_missing = True
             else:
                 try:
                     casts_per_bait = int(await self.config.casts_per_bait())
-                    cooldown_seconds = int(
-                        await self.config.bait_cooldown_seconds()
-                    )
-
+                    cooldown = int(await self.config.bait_cooldown_seconds())
                     if not 1 <= casts_per_bait <= 100:
-                        raise ValueError("Casts per bait is outside valid bounds.")
-                    if not 0 <= cooldown_seconds <= 86400:
-                        raise ValueError("Bait cooldown is outside valid bounds.")
+                        raise ValueError("Invalid casts-per-bait setting.")
+                    if not 0 <= cooldown <= 86400:
+                        raise ValueError("Invalid bait cooldown setting.")
 
                     user_config = self.config.user(interaction.user)
                     bait_state = await user_config.bait_state()
                     if not isinstance(bait_state, dict):
                         bait_state = {}
 
-                    casts_remaining = int(
+                    now = time.time()
+                    remaining_casts = int(
                         bait_state.get("casts_remaining", casts_per_bait)
                     )
-                    cooldown_until = float(
-                        bait_state.get("cooldown_until", 0)
-                    )
+                    cooldown_until = float(bait_state.get("cooldown_until", 0))
 
-                    if cooldown_until > current_time:
-                        wait = math.ceil(cooldown_until - current_time)
+                    if cooldown_until > now:
+                        wait = math.ceil(cooldown_until - now)
                         cooldown_message = (
-                            f"Your bait is reloading. Try again in "
-                            f"**{wait}** second{'s' if wait != 1 else ''}."
+                            f"Your bait is reloading. Try again in **{wait}** "
+                            f"second{'s' if wait != 1 else ''}."
                         )
                     else:
-                        # Refill after an expired cooldown. Also clamp old
-                        # saved counts if an admin lowers casts-per-bait.
-                        if cooldown_until > 0 or casts_remaining <= 0:
-                            casts_remaining = casts_per_bait
+                        if cooldown_until or remaining_casts <= 0:
+                            remaining_casts = casts_per_bait
                             cooldown_until = 0
-                        casts_remaining = min(casts_remaining, casts_per_bait)
+                        remaining_casts = min(remaining_casts, casts_per_bait)
 
                         rare_chance = float(location["rare_chance"])
-                        if (
-                            not math.isfinite(rare_chance)
-                            or not 0 <= rare_chance <= 100
-                        ):
-                            raise ValueError(
-                                "Rare chance must be between 0 and 100."
-                            )
+                        if not math.isfinite(rare_chance) or not 0 <= rare_chance <= 100:
+                            raise ValueError("Rare chance must be between 0 and 100.")
 
                         rarity = random.choices(
                             ["rare", "common"],
@@ -488,24 +430,16 @@ class LokFishing(commands.Cog):
                         )[0]
 
                         table, weights = self._validated_table(location, rarity)
-                        outcome = random.choices(
-                            table,
-                            weights=weights,
-                            k=1,
-                        )[0]
+                        outcome = random.choices(table, weights=weights, k=1)[0]
                         no_catch = is_nothing(outcome)
 
-                        if no_catch:
-                            self._last_catch[user_id] = time.monotonic()
-                        else:
+                        if not no_catch:
                             fish_name = outcome["name"]
-                            fish_chance_percent = self._fish_chance_percent(
+                            fish_chance = self._fish_chance_percent(
                                 location,
                                 rare_chance,
                                 fish_name,
                             )
-
-                            # Rare catches yield one fish; common catches yield 1–3.
                             amount = 1 if rarity == "rare" else random.randint(1, 3)
 
                             descriptions = await self.config.fish_descriptions()
@@ -518,73 +452,57 @@ class LokFishing(commands.Cog):
                                 int(inventory.get(fish_name, 0)) + amount
                             )
                             await user_config.inventory.set(inventory)
-
                             completion_prompts = (
-                                await self._record_new_collection_completions(
+                                await self._newly_completed_collections(
                                     interaction.user,
                                     inventory,
-                                    locations,
                                 )
                             )
 
-                            self._last_catch[user_id] = time.monotonic()
-
-                        # Every valid cast consumes one bait, including a miss.
-                        casts_remaining -= 1
-                        cooldown_until = 0
-
-                        if casts_remaining <= 0:
-                            if cooldown_seconds > 0:
-                                cooldown_until = time.time() + cooldown_seconds
-                                bait_status = (
-                                    f"Bait exhausted. Your next cast is available "
-                                    f"in **{cooldown_seconds}** seconds."
-                                )
-                                casts_remaining = 0
-                            else:
-                                casts_remaining = casts_per_bait
-                                bait_status = (
-                                    f"Bait refilled. **{casts_remaining}** casts available."
-                                )
-                        else:
+                        # Every cast, including Nothing, uses one cast of bait.
+                        remaining_casts -= 1
+                        if remaining_casts <= 0 and cooldown > 0:
+                            cooldown_until = time.time() + cooldown
+                            remaining_casts = 0
                             bait_status = (
-                                f"**{casts_remaining}** cast"
-                                f"{'s' if casts_remaining != 1 else ''} "
-                                "remaining before reloading."
+                                f"Bait exhausted. Reload in **{cooldown}** seconds."
+                            )
+                        elif remaining_casts <= 0:
+                            remaining_casts = casts_per_bait
+                            cooldown_until = 0
+                            bait_status = (
+                                f"Bait refilled: **{casts_per_bait}** casts ready."
+                            )
+                        else:
+                            cooldown_until = 0
+                            bait_status = (
+                                f"**{remaining_casts}** cast"
+                                f"{'s' if remaining_casts != 1 else ''} "
+                                "remaining before reload."
                             )
 
-                        await user_config.bait_state.set(
-                            {
-                                "casts_remaining": casts_remaining,
-                                "cooldown_until": cooldown_until,
-                            }
-                        )
+                        await user_config.bait_state.set({
+                            "casts_remaining": remaining_casts,
+                            "cooldown_until": cooldown_until,
+                        })
 
                 except (KeyError, TypeError, ValueError, OverflowError):
                     config_error = True
-                    log.exception(
-                        "Invalid fishing configuration for %s",
-                        location_key,
-                    )
+                    log.exception("Fishing configuration error at %s", location_key)
 
-        if missing_location:
+        if location_missing:
             await interaction.followup.send(
                 "That fishing location is not configured.",
                 ephemeral=True,
             )
             return
-
         if cooldown_message:
-            await interaction.followup.send(
-                cooldown_message,
-                ephemeral=True,
-            )
+            await interaction.followup.send(cooldown_message, ephemeral=True)
             return
-
         if config_error:
             await interaction.followup.send(
-                "This location or bait setting is misconfigured. "
-                "Ask an admin to check the dashboard or `!lokfish settings`.",
+                "Fishing or bait settings are misconfigured. Ask an admin to "
+                "check the dashboard or `!lokfish settings`.",
                 ephemeral=True,
             )
             return
@@ -592,10 +510,7 @@ class LokFishing(commands.Cog):
         if no_catch:
             embed = discord.Embed(
                 title="No catch this time",
-                description=(
-                    f"You cast your line at **{location['label']}**, "
-                    "but caught nothing."
-                ),
+                description=f"You cast at **{location['label']}**, but caught nothing.",
                 color=discord.Color.dark_grey(),
             )
             embed.add_field(name="Rarity roll", value=rarity.title())
@@ -606,17 +521,12 @@ class LokFishing(commands.Cog):
         embed = discord.Embed(
             title=f"You caught {fish_name}!",
             description=(
-                f"**{amount} × {fish_name}** caught at "
-                f"**{location['label']}**."
+                f"**{amount} × {fish_name}** caught at **{location['label']}**."
             ),
-            color=(
-                discord.Color.gold()
-                if rarity == "rare"
-                else discord.Color.blue()
-            ),
+            color=discord.Color.gold() if rarity == "rare" else discord.Color.blue(),
         )
         embed.add_field(name="Rarity", value=rarity.title())
-        embed.add_field(name="Added to your inventory", value=str(amount))
+        embed.add_field(name="Added to inventory", value=str(amount))
         embed.add_field(name="Bait", value=bait_status, inline=False)
 
         if fish_description:
@@ -626,10 +536,9 @@ class LokFishing(commands.Cog):
                 inline=False,
             )
 
-        avatar_data = await asyncio.to_thread(self._make_avatar, fish_name)
-
-        if avatar_data is not None:
-            image_bytes, filename = avatar_data
+        avatar = await asyncio.to_thread(self._make_avatar, fish_name)
+        if avatar:
+            image_bytes, filename = avatar
             embed.set_thumbnail(url=f"attachment://{filename}")
             await interaction.followup.send(
                 embed=embed,
@@ -647,8 +556,8 @@ class LokFishing(commands.Cog):
             )
 
         if (
-            fish_chance_percent is not None
-            and fish_chance_percent <= ULTRARARE_THRESHOLD_PERCENT
+            fish_chance is not None
+            and fish_chance <= ULTRARARE_THRESHOLD_PERCENT
             and interaction.guild is not None
             and interaction.channel is not None
         ):
@@ -656,7 +565,7 @@ class LokFishing(commands.Cog):
                 await interaction.channel.send(
                     f"✨ {interaction.user.mention} caught an ultra-rare "
                     f"**{fish_name}** at **{location['label']}**! "
-                    f"(about **{fish_chance_percent:.2f}%** chance per cast)",
+                    f"(about **{fish_chance:.2f}%** chance per cast)",
                     delete_after=3600,
                     allowed_mentions=discord.AllowedMentions(
                         users=True,
@@ -665,13 +574,12 @@ class LokFishing(commands.Cog):
                     ),
                 )
             except discord.HTTPException:
-                log.exception("Could not send ultra-rare catch announcement.")
+                log.exception("Could not send ultra-rare announcement.")
 
     @staticmethod
-    def _make_avatar(fish_name: str):
-        """Load a local avatar, resize to 300×300, and return PNG bytes."""
+    def _make_avatar(fish_name):
         slug = fish_slug(fish_name)
-        image_path = next(
+        path = next(
             (
                 AVATAR_DIR / f"{slug}{extension}"
                 for extension in IMAGE_EXTENSIONS
@@ -679,24 +587,21 @@ class LokFishing(commands.Cog):
             ),
             None,
         )
-
-        if image_path is None:
+        if path is None:
             return None
 
         try:
             from PIL import Image
 
-            with Image.open(image_path) as source:
+            with Image.open(path) as source:
                 image = source.convert("RGBA")
                 resampling = getattr(Image, "Resampling", Image)
                 image = image.resize((300, 300), resampling.LANCZOS)
-
                 buffer = io.BytesIO()
                 image.save(buffer, format="PNG")
                 return buffer.getvalue(), "fish-avatar.png"
-
         except Exception:
-            log.exception("Could not process fish avatar %s", image_path)
+            log.exception("Could not process avatar %s", path)
             return None
 
     async def _send_inventory(self, ctx, member=None):
@@ -707,44 +612,33 @@ class LokFishing(commands.Cog):
             title=f"{member.display_name}'s Fish Inventory",
             color=discord.Color.blue(),
         )
-
         if not inventory:
-            embed.description = (
-                "No fish caught yet. Use `!lokfish` to start fishing."
-            )
+            embed.description = "No fish caught yet. Use `!lokfish` to start fishing."
         else:
             entries = sorted(
                 inventory.items(),
-                key=lambda item: (-int(item[1]), item[0].lower()),
+                key=lambda item: (-int(item[1]), item[0].casefold()),
             )
-            lines = [f"**{name}** — {amount}" for name, amount in entries]
-            description = "\n".join(lines)
-
-            if len(description) > 3900:
-                description = description[:3850].rsplit("\n", 1)[0]
-                description += "\n…inventory truncated."
-
-            embed.description = description
+            lines = [f"**{name}** — {count}" for name, count in entries]
+            embed.description = "\n".join(lines)[:3900]
 
         await ctx.send(embed=embed)
 
     @commands.command(name="inventory", aliases=["fishinventory"])
     async def inventory_command(self, ctx, member: discord.Member = None):
-        """Show your inventory, or another member's inventory."""
+        """Show a player's fish inventory."""
         await self._send_inventory(ctx, member)
 
     @lokfish.command(name="profile", aliases=["inventory"])
     async def profile(self, ctx, member: discord.Member = None):
-        """Show your inventory, or another member's inventory."""
+        """Show a player's fish inventory."""
         await self._send_inventory(ctx, member)
 
     @commands.command(name="collection", aliases=["collections"])
     async def collection_command(self, ctx):
-        """Show your progress toward each configured collection."""
-        locations = await self.config.locations()
+        """Show progress for all global fish collections."""
         collections = await self.config.collections()
         inventory = await self.config.user(ctx.author).inventory()
-
         owned = {
             str(name).casefold()
             for name, amount in inventory.items()
@@ -752,43 +646,30 @@ class LokFishing(commands.Cog):
         }
 
         lines = []
-        for key, location in locations.items():
-            collection = collections.get(key, {})
-
+        for key, collection in collections.items():
+            name = str(collection.get("name", key))
             if not collection.get("enabled", True):
-                lines.append(f"**{location['label']}** — collection disabled")
+                lines.append(f"**{name}** — disabled")
                 continue
 
             required = collection.get("fish", [])
-            if not required:
-                lines.append(f"**{location['label']}** — no fish configured")
-                continue
-
             missing = [
-                name for name in required
-                if str(name).casefold() not in owned
+                fish for fish in required
+                if str(fish).casefold() not in owned
             ]
 
             if missing:
                 lines.append(
-                    f"**{location['label']}** — "
-                    f"{len(required) - len(missing)}/{len(required)} fish\n"
+                    f"**{name}** — {len(required) - len(missing)}/{len(required)}\n"
                     f"Missing: {', '.join(missing)}"
                 )
             else:
-                lines.append(
-                    f"✅ **{location['label']}** — collection complete "
-                    f"({len(required)}/{len(required)})"
-                )
+                lines.append(f"✅ **{name}** — complete")
 
-        description = "\n\n".join(lines) or "No collections are configured."
-        if len(description) > 3900:
-            description = description[:3850].rsplit("\n", 1)[0]
-            description += "\n…collection list truncated."
-
+        description = "\n\n".join(lines) or "No collections configured."
         embed = discord.Embed(
             title=f"{ctx.author.display_name}'s Collections",
-            description=description,
+            description=description[:3900],
             color=discord.Color.green(),
         )
         await ctx.send(embed=embed)
@@ -796,7 +677,6 @@ class LokFishing(commands.Cog):
     @lokfish.command(name="settings")
     @checks.admin_or_permissions(manage_guild=True)
     async def settings(self, ctx):
-        """Show fishing rates, tables, and bait settings."""
         locations = await self.config.locations()
         casts = await self.config.casts_per_bait()
         cooldown = await self.config.bait_cooldown_seconds()
@@ -805,28 +685,24 @@ class LokFishing(commands.Cog):
             title="Fishing Settings",
             description=(
                 f"Casts per bait: **{casts}**\n"
-                f"Bait cooldown: **{cooldown} seconds**\n"
-                "Bait settings are editable in the web dashboard. "
-                "Each valid cast, including Nothing, uses one bait."
+                f"Bait reload cooldown: **{cooldown} seconds**\n"
+                "Each cast, including Nothing, uses bait. "
+                "Edit bait settings and table percentages in the dashboard."
             ),
             color=discord.Color.blue(),
         )
 
         for location in locations.values():
             common = ", ".join(
-                f"{entry['name']} (weight {entry['weight']})"
+                f"{entry['name']} ({entry['weight']})"
                 for entry in location.get("common", [])[:10]
             ) or "—"
             rare = ", ".join(
-                f"{entry['name']} (weight {entry['weight']})"
+                f"{entry['name']} ({entry['weight']})"
                 for entry in location.get("rare", [])[:10]
             ) or "—"
-
             embed.add_field(
-                name=(
-                    f"{location['label']} — "
-                    f"rare chance {location['rare_chance']}%"
-                ),
+                name=f"{location['label']} — rare {location['rare_chance']}%",
                 value=f"**Common:** {common}\n**Rare:** {rare}",
                 inline=False,
             )
@@ -836,192 +712,107 @@ class LokFishing(commands.Cog):
     @lokfish.command(name="setrare")
     @checks.admin_or_permissions(manage_guild=True)
     async def setrare(self, ctx, location_name: str, percent: float):
-        """Set a location's rare chance."""
-        location_key = normalize_location(location_name)
-
+        key = normalize_location(location_name)
         if not math.isfinite(percent) or not 0 <= percent <= 100:
             await ctx.send("Rare chance must be between 0 and 100.")
             return
 
         async with self._state_lock:
             locations = await self.config.locations()
-            location = locations.get(location_key)
-
-            if location is None:
-                await ctx.send(
-                    "Unknown location. Use the dashboard to manage locations."
-                )
+            if key not in locations:
+                await ctx.send("Unknown location.")
                 return
-
-            location["rare_chance"] = float(percent)
+            locations[key]["rare_chance"] = float(percent)
             await self.config.locations.set(locations)
 
-        await ctx.send(
-            f"Rare-catch chance at **{location['label']}** "
-            f"is now **{percent:g}%**."
-        )
-
-    @lokfish.command(name="setcooldown")
-    @checks.admin_or_permissions(manage_guild=True)
-    async def setcooldown(self, ctx, seconds: int):
-        """Set the legacy catch cooldown setting."""
-        if not 0 <= seconds <= 86400:
-            await ctx.send("Cooldown must be between 0 and 86400 seconds.")
-            return
-
-        await self.config.cooldown_seconds.set(seconds)
-        await ctx.send(
-            "The legacy setting was updated. Bait reload settings are managed "
-            "in the dashboard."
-        )
+        await ctx.send(f"Rare chance updated to **{percent:g}%**.")
 
     @lokfish.command(name="addfish")
     @checks.admin_or_permissions(manage_guild=True)
-    async def addfish(
-        self,
-        ctx,
-        location_name: str,
-        rarity: str,
-        weight: float,
-        *,
-        fish_name: str,
-    ):
-        """Add a fish to a location's table; weight remains an admin command."""
-        location_key = normalize_location(location_name)
+    async def addfish(self, ctx, location_name: str, rarity: str, weight: float, *, fish_name: str):
+        key = normalize_location(location_name)
         rarity = rarity.lower()
+        fish_name = fish_name.strip()
 
         if rarity not in RARITIES:
-            await ctx.send("Rarity must be `common` or `rare`.")
+            await ctx.send("Rarity must be common or rare.")
             return
         if not math.isfinite(weight) or weight <= 0:
-            await ctx.send("Weight must be a positive number.")
+            await ctx.send("Weight must be positive.")
             return
-
-        fish_name = fish_name.strip()
-        if not fish_name or len(fish_name) > 80:
-            await ctx.send("Fish names must be between 1 and 80 characters.")
-            return
-        if fish_name.casefold() == "nothing":
-            await ctx.send("Use `addnothing` to add a no-catch outcome.")
+        if not fish_name or len(fish_name) > 80 or fish_name.casefold() == "nothing":
+            await ctx.send("Enter a valid fish name; use addnothing for a miss.")
             return
 
         async with self._state_lock:
             locations = await self.config.locations()
-            location = locations.get(location_key)
-
-            if location is None:
-                await ctx.send(
-                    "Unknown location. Use the dashboard to manage locations."
-                )
+            if key not in locations:
+                await ctx.send("Unknown location.")
                 return
-
-            table = location[rarity]
-            if any(
-                entry["name"].casefold() == fish_name.casefold()
-                for entry in table
-            ):
-                await ctx.send("That fish is already in this rarity table.")
+            table = locations[key][rarity]
+            if any(entry["name"].casefold() == fish_name.casefold() for entry in table):
+                await ctx.send("That fish is already in the table.")
                 return
-            if len(table) >= 100:
-                await ctx.send("That rarity table already has 100 entries.")
-                return
-
             table.append({"name": fish_name, "weight": float(weight)})
             await self.config.locations.set(locations)
+            await self.add_catalog_names([fish_name])
 
-        await ctx.send(
-            f"Added **{fish_name}** to the **{rarity}** table at "
-            f"**{location['label']}**."
-        )
+        await ctx.send(f"Added **{fish_name}** to the {rarity} table.")
 
     @lokfish.command(name="addnothing")
     @checks.admin_or_permissions(manage_guild=True)
     async def addnothing(self, ctx, location_name: str, weight: float):
-        """Add a no-catch outcome to a location's common table."""
-        location_key = normalize_location(location_name)
-
+        key = normalize_location(location_name)
         if not math.isfinite(weight) or weight <= 0:
-            await ctx.send("Weight must be a positive number.")
+            await ctx.send("Weight must be positive.")
             return
 
         async with self._state_lock:
             locations = await self.config.locations()
-            location = locations.get(location_key)
-
-            if location is None:
-                await ctx.send(
-                    "Unknown location. Use the dashboard to manage locations."
-                )
+            if key not in locations:
+                await ctx.send("Unknown location.")
                 return
-
-            table = location["common"]
+            table = locations[key]["common"]
             if any(is_nothing(entry) for entry in table):
-                await ctx.send("That common table already has a Nothing outcome.")
+                await ctx.send("Nothing is already in the common table.")
                 return
-            if len(table) >= 100:
-                await ctx.send("That common table already has 100 entries.")
-                return
-
-            table.append(
-                {"name": "Nothing", "weight": float(weight), "type": "nothing"}
-            )
+            table.append({
+                "name": "Nothing",
+                "weight": float(weight),
+                "type": "nothing",
+            })
             await self.config.locations.set(locations)
 
-        await ctx.send(
-            f"Added **Nothing** to the common table at **{location['label']}**."
-        )
+        await ctx.send("Added Nothing to the common table.")
 
     @lokfish.command(name="removefish")
     @checks.admin_or_permissions(manage_guild=True)
-    async def removefish(
-        self,
-        ctx,
-        location_name: str,
-        rarity: str,
-        *,
-        fish_name: str,
-    ):
-        """Remove a fish or Nothing entry from a table."""
-        location_key = normalize_location(location_name)
+    async def removefish(self, ctx, location_name: str, rarity: str, *, fish_name: str):
+        key = normalize_location(location_name)
         rarity = rarity.lower()
-
         if rarity not in RARITIES:
-            await ctx.send("Rarity must be `common` or `rare`.")
+            await ctx.send("Rarity must be common or rare.")
             return
 
         async with self._state_lock:
             locations = await self.config.locations()
-            location = locations.get(location_key)
-
-            if location is None:
-                await ctx.send(
-                    "Unknown location. Use the dashboard to manage locations."
-                )
+            if key not in locations:
+                await ctx.send("Unknown location.")
                 return
-
-            table = location[rarity]
-            match = next(
-                (
-                    entry for entry in table
-                    if entry["name"].strip().casefold()
-                    == fish_name.strip().casefold()
-                ),
+            table = locations[key][rarity]
+            entry = next(
+                (item for item in table
+                 if item["name"].casefold() == fish_name.strip().casefold()),
                 None,
             )
-
-            if match is None:
-                await ctx.send("That entry is not in the specified table.")
+            if entry is None:
+                await ctx.send("That entry is not in the table.")
                 return
             if len(table) <= 1:
-                await ctx.send(
-                    "Each rarity table must keep at least one entry."
-                )
+                await ctx.send("Each table must retain at least one entry.")
                 return
 
-            table.remove(match)
+            table.remove(entry)
             await self.config.locations.set(locations)
 
-        await ctx.send(
-            f"Removed **{match['name']}** from the **{rarity}** table at "
-            f"**{location['label']}**."
-        )
+        await ctx.send(f"Removed **{entry['name']}** from the {rarity} table.")

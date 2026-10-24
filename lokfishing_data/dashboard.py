@@ -16,8 +16,7 @@ MAX_COLLECTION_FISH = 100
 MAX_COLLECTION_PROMPT_LENGTH = 1500
 
 DEFAULT_COLLECTION_PROMPT = (
-    "🎉 **{user}**, you completed the **{collection}** collection "
-    "at **{location}**!"
+    "🎉 **{user}**, you completed the **{collection}** collection!"
 )
 
 
@@ -27,6 +26,26 @@ def _slug(value: str) -> str:
 
 def _location_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+
+
+def _table_rates(table: list) -> list:
+    if not table:
+        return []
+
+    weights = []
+    for entry in table:
+        try:
+            weight = float(entry.get("weight", 0))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("Table contains an invalid entry.") from exc
+
+        if not math.isfinite(weight) or weight <= 0:
+            raise ValueError("Table values must be positive numbers.")
+
+        weights.append(weight)
+
+    total = sum(weights)
+    return [weight * 100.0 / total for weight in weights]
 
 
 def _positive_number(value, label: str) -> float:
@@ -41,37 +60,18 @@ def _positive_number(value, label: str) -> float:
     return number
 
 
-def _percentage(value, label: str = "Percentage") -> float:
+def _percentage(value, label: str, allow_zero: bool = False) -> float:
     try:
         percent = float(value)
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"{label} must be greater than 0 and at most 100.") from exc
+        raise ValueError(f"{label} must be a valid percentage.") from exc
 
-    if not math.isfinite(percent) or not 0 < percent <= 100:
-        raise ValueError(f"{label} must be greater than 0 and at most 100.")
+    minimum_ok = percent >= 0 if allow_zero else percent > 0
+    if not math.isfinite(percent) or not minimum_ok or percent > 100:
+        qualifier = "between 0 and 100" if allow_zero else "greater than 0 and at most 100"
+        raise ValueError(f"{label} must be {qualifier}.")
 
     return percent
-
-
-def _table_rates(table: list) -> list:
-    """Return each entry's percentage of the table total."""
-    if not table:
-        raise ValueError("The drop table is empty.")
-
-    weights = []
-    for entry in table:
-        try:
-            weight = float(entry.get("weight", 0))
-        except (AttributeError, TypeError, ValueError) as exc:
-            raise ValueError("The table contains an invalid entry.") from exc
-
-        if not math.isfinite(weight) or weight <= 0:
-            raise ValueError("Table values must be positive numbers.")
-
-        weights.append(weight)
-
-    total = sum(weights)
-    return [weight * 100.0 / total for weight in weights]
 
 
 def _clean_description(value) -> str:
@@ -80,16 +80,15 @@ def _clean_description(value) -> str:
     if not isinstance(value, str):
         raise ValueError("Description must be text.")
 
-    description = value.strip()
-    if len(description) > MAX_DESCRIPTION_LENGTH:
+    value = value.strip()
+    if len(value) > MAX_DESCRIPTION_LENGTH:
         raise ValueError(
             f"Description must be {MAX_DESCRIPTION_LENGTH} characters or fewer."
         )
+    return value
 
-    return description
 
-
-def _clean_collection_fish(value) -> list:
+def _clean_fish_list(value) -> list:
     if not isinstance(value, list):
         raise ValueError("Collection fish must be a list.")
 
@@ -103,32 +102,32 @@ def _clean_collection_fish(value) -> list:
         if len(name) > 80:
             raise ValueError("Fish names must be 80 characters or fewer.")
         if name.casefold() == "nothing":
-            raise ValueError("Nothing cannot be a required collection fish.")
+            raise ValueError("Nothing cannot be in a collection.")
 
-        if name.casefold() not in seen:
+        normalized = name.casefold()
+        if normalized not in seen:
             result.append(name)
-            seen.add(name.casefold())
+            seen.add(normalized)
 
     if len(result) > MAX_COLLECTION_FISH:
         raise ValueError(
-            f"A collection may contain at most {MAX_COLLECTION_FISH} fish."
+            f"A collection can contain at most {MAX_COLLECTION_FISH} fish."
         )
 
     return result
 
 
-def _clean_collection_prompt(value) -> str:
+def _clean_prompt(value) -> str:
     if not isinstance(value, str):
-        raise ValueError("Collection prompt must be text.")
+        raise ValueError("Completion prompt must be text.")
 
-    prompt = value.strip()
-    if len(prompt) > MAX_COLLECTION_PROMPT_LENGTH:
+    value = value.strip()
+    if len(value) > MAX_COLLECTION_PROMPT_LENGTH:
         raise ValueError(
-            f"Collection prompt must be {MAX_COLLECTION_PROMPT_LENGTH} "
+            f"Completion prompt must be {MAX_COLLECTION_PROMPT_LENGTH} "
             "characters or fewer."
         )
-
-    return prompt
+    return value
 
 
 class FishingDashboard:
@@ -149,20 +148,11 @@ class FishingDashboard:
         self.app.router.add_get("/api/state", self.get_state)
         self.app.router.add_get("/api/avatar/{filename}", self.get_avatar)
 
-        self.app.router.add_patch(
-            "/api/game-settings",
-            self.update_game_settings,
-        )
+        self.app.router.add_patch("/api/game-settings", self.update_game_settings)
 
         self.app.router.add_post("/api/locations", self.create_location)
-        self.app.router.add_patch(
-            "/api/locations/{key}",
-            self.update_location,
-        )
-        self.app.router.add_delete(
-            "/api/locations/{key}",
-            self.delete_location,
-        )
+        self.app.router.add_patch("/api/locations/{key}", self.update_location)
+        self.app.router.add_delete("/api/locations/{key}", self.delete_location)
 
         self.app.router.add_post(
             "/api/locations/{key}/entries",
@@ -174,16 +164,21 @@ class FishingDashboard:
             "/api/fish-description",
             self.update_fish_description,
         )
+
+        self.app.router.add_post("/api/collections", self.create_collection)
         self.app.router.add_patch(
             "/api/collections/{key}",
             self.update_collection,
+        )
+        self.app.router.add_delete(
+            "/api/collections/{key}",
+            self.delete_collection,
         )
 
         self.app.router.add_post("/api/avatar", self.upload_avatar)
 
     @web.middleware
     async def _auth_middleware(self, request, handler):
-        """Require the dashboard password for all API routes."""
         if request.path.startswith("/api/"):
             authorization = request.headers.get("Authorization", "")
             supplied = authorization.removeprefix("Bearer ").strip()
@@ -192,22 +187,14 @@ class FishingDashboard:
                 supplied,
                 self.password,
             ):
-                return web.json_response(
-                    {"error": "Unauthorized"},
-                    status=401,
-                )
+                return web.json_response({"error": "Unauthorized"}, status=401)
 
         return await handler(request)
 
     async def start(self):
         self.runner = web.AppRunner(self.app)
         await self.runner.setup()
-
-        site = web.TCPSite(
-            self.runner,
-            host="0.0.0.0",
-            port=self.port,
-        )
+        site = web.TCPSite(self.runner, host="0.0.0.0", port=self.port)
         await site.start()
 
     async def close(self):
@@ -216,21 +203,14 @@ class FishingDashboard:
             self.runner = None
 
     async def index(self, request):
-        return web.Response(
-            text=DASHBOARD_HTML,
-            content_type="text/html",
-        )
+        return web.Response(text=DASHBOARD_HTML, content_type="text/html")
 
-    def _list_avatars(self):
-        """List local image files, excluding symlinks."""
+    def _avatars(self):
         if not AVATAR_DIR.is_dir():
             return []
 
-        avatars = []
-        for path in sorted(
-            AVATAR_DIR.iterdir(),
-            key=lambda item: item.name.lower(),
-        ):
+        result = []
+        for path in sorted(AVATAR_DIR.iterdir(), key=lambda item: item.name.lower()):
             if (
                 path.is_symlink()
                 or not path.is_file()
@@ -238,30 +218,25 @@ class FishingDashboard:
             ):
                 continue
 
-            avatars.append(
-                {
-                    "filename": path.name,
-                    "name": re.sub(
-                        r"[-_]+",
-                        " ",
-                        path.stem,
-                    ).strip().title(),
-                }
-            )
-
-        return avatars
+            result.append({
+                "filename": path.name,
+                "name": re.sub(r"[-_]+", " ", path.stem).strip().title(),
+            })
+        return result
 
     async def get_state(self, request):
-        """Return current settings, tables, collections, and local avatars."""
         locations = copy.deepcopy(await self.cog.config.locations())
-        descriptions = await self.cog.config.fish_descriptions()
         collections = copy.deepcopy(await self.cog.config.collections())
-        avatars = self._list_avatars()
+        descriptions = await self.cog.config.fish_descriptions()
+        catalog = list(await self.cog.config.fish_catalog())
+        avatars = self._avatars()
 
-        game_settings = {
-            "casts_per_bait": await self.cog.config.casts_per_bait(),
-            "bait_cooldown_seconds": await self.cog.config.bait_cooldown_seconds(),
-        }
+        # Include any local avatar names not already included in the JSON catalog.
+        catalog_keys = {str(name).casefold() for name in catalog}
+        for avatar in avatars:
+            if avatar["name"].casefold() not in catalog_keys:
+                catalog.append(avatar["name"])
+                catalog_keys.add(avatar["name"].casefold())
 
         avatar_by_slug = {
             _slug(Path(item["filename"]).stem): item["filename"]
@@ -271,109 +246,93 @@ class FishingDashboard:
         for location in locations.values():
             for rarity in ("common", "rare"):
                 table = location.get(rarity, [])
-
-                try:
-                    rates = _table_rates(table)
-                except ValueError:
-                    rates = [0.0] * len(table)
+                rates = _table_rates(table)
 
                 for entry, rate in zip(table, rates):
                     name = str(entry.get("name", "")).strip()
-
-                    if name.casefold() == "nothing":
-                        entry["avatar"] = None
-                        entry["description"] = ""
-                    else:
-                        entry["avatar"] = avatar_by_slug.get(_slug(name))
-                        entry["description"] = descriptions.get(
-                            name.casefold(),
-                            "",
-                        )
-
-                    # The cog continues storing relative weights internally.
                     entry["rate_percent"] = rate
+                    entry["avatar"] = (
+                        None if name.casefold() == "nothing"
+                        else avatar_by_slug.get(_slug(name))
+                    )
+                    entry["description"] = (
+                        "" if name.casefold() == "nothing"
+                        else descriptions.get(name.casefold(), "")
+                    )
 
-        return web.json_response(
+        catalog_items = [
             {
-                "locations": locations,
-                "collections": collections,
-                "avatars": avatars,
-                "game_settings": game_settings,
+                "name": str(name),
+                "avatar": avatar_by_slug.get(_slug(str(name))),
             }
-        )
+            for name in sorted(catalog, key=lambda item: str(item).casefold())
+        ]
+
+        return web.json_response({
+            "locations": locations,
+            "collections": collections,
+            "fish_catalog": catalog_items,
+            "avatars": avatars,
+            "game_settings": {
+                "casts_per_bait": await self.cog.config.casts_per_bait(),
+                "bait_cooldown_seconds": (
+                    await self.cog.config.bait_cooldown_seconds()
+                ),
+            },
+        })
 
     async def get_avatar(self, request):
-        """Serve only an image present in the local avatar library."""
         filename = request.match_info["filename"]
-        allowed = {item["filename"] for item in self._list_avatars()}
+        allowed = {item["filename"] for item in self._avatars()}
 
         if filename not in allowed:
-            return web.json_response(
-                {"error": "Avatar not found."},
-                status=404,
-            )
+            return web.json_response({"error": "Avatar not found."}, status=404)
 
         return web.FileResponse(AVATAR_DIR / filename)
 
     async def update_game_settings(self, request):
-        """Save per-player casts-per-bait and cooldown settings."""
         try:
             data = await request.json()
+            casts = int(data.get("casts_per_bait"))
+            cooldown = int(data.get("bait_cooldown_seconds"))
 
-            casts_per_bait = int(data.get("casts_per_bait"))
-            cooldown_seconds = int(data.get("bait_cooldown_seconds"))
-
-            if not 1 <= casts_per_bait <= 100:
+            if not 1 <= casts <= 100:
                 raise ValueError("Casts per bait must be between 1 and 100.")
-            if not 0 <= cooldown_seconds <= 86400:
-                raise ValueError(
-                    "Bait cooldown must be between 0 and 86400 seconds."
-                )
+            if not 0 <= cooldown <= 86400:
+                raise ValueError("Cooldown must be between 0 and 86400 seconds.")
 
             async with self.cog._state_lock:
-                await self.cog.config.casts_per_bait.set(casts_per_bait)
-                await self.cog.config.bait_cooldown_seconds.set(
-                    cooldown_seconds
-                )
+                await self.cog.config.casts_per_bait.set(casts)
+                await self.cog.config.bait_cooldown_seconds.set(cooldown)
 
-            return web.json_response(
-                {
-                    "ok": True,
-                    "casts_per_bait": casts_per_bait,
-                    "bait_cooldown_seconds": cooldown_seconds,
-                }
-            )
-
+            return web.json_response({
+                "ok": True,
+                "casts_per_bait": casts,
+                "bait_cooldown_seconds": cooldown,
+            })
         except (ValueError, TypeError, KeyError) as exc:
             return web.json_response({"error": str(exc)}, status=400)
 
     async def create_location(self, request):
         try:
             data = await request.json()
-
             label = str(data.get("label", "")).strip()
             common_name = str(data.get("common_fish", "")).strip()
             rare_name = str(data.get("rare_fish", "")).strip()
-
-            try:
-                rare_chance = float(data.get("rare_chance", 5))
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    "Rare chance must be between 0 and 100."
-                ) from exc
+            rare_chance = _percentage(
+                data.get("rare_chance", 5),
+                "Rare catch chance",
+                allow_zero=True,
+            )
 
             if not label or len(label) > 80:
                 raise ValueError("Location name must be 1–80 characters.")
             if not common_name or len(common_name) > 80:
-                raise ValueError("Enter an initial common fish name.")
+                raise ValueError("Enter an initial common fish.")
             if not rare_name or len(rare_name) > 80:
-                raise ValueError("Enter an initial rare fish name.")
-            if common_name.casefold() == "nothing":
-                raise ValueError("The initial common entry must be a fish.")
-            if rare_name.casefold() == "nothing":
-                raise ValueError("The initial rare entry must be a fish.")
-            if not math.isfinite(rare_chance) or not 0 <= rare_chance <= 100:
-                raise ValueError("Rare chance must be between 0 and 100.")
+                raise ValueError("Enter an initial rare fish.")
+            if common_name.casefold() == "nothing" or rare_name.casefold() == "nothing":
+                raise ValueError("Initial entries must be fish, not Nothing.")
 
             key = _location_key(label)
             if not key:
@@ -381,8 +340,6 @@ class FishingDashboard:
 
             async with self.cog._state_lock:
                 locations = await self.cog.config.locations()
-                collections = await self.cog.config.collections()
-
                 if key in locations:
                     raise ValueError("A location with that name already exists.")
 
@@ -392,17 +349,10 @@ class FishingDashboard:
                     "common": [{"name": common_name, "weight": 1.0}],
                     "rare": [{"name": rare_name, "weight": 1.0}],
                 }
-                collections[key] = {
-                    "enabled": True,
-                    "fish": [common_name],
-                    "prompt": DEFAULT_COLLECTION_PROMPT,
-                }
-
                 await self.cog.config.locations.set(locations)
-                await self.cog.config.collections.set(collections)
+                await self.cog.add_catalog_names([common_name, rare_name])
 
             return web.json_response({"ok": True, "key": key})
-
         except (ValueError, TypeError, KeyError) as exc:
             return web.json_response({"error": str(exc)}, status=400)
 
@@ -415,7 +365,6 @@ class FishingDashboard:
             async with self.cog._state_lock:
                 locations = await self.cog.config.locations()
                 location = locations.get(key)
-
                 if location is None:
                     return web.json_response(
                         {"error": "Location not found."},
@@ -425,29 +374,19 @@ class FishingDashboard:
                 if "label" in data:
                     label = str(data["label"]).strip()
                     if not label or len(label) > 80:
-                        raise ValueError(
-                            "Location name must be 1–80 characters."
-                        )
+                        raise ValueError("Location name must be 1–80 characters.")
                     location["label"] = label
 
                 if "rare_chance" in data:
-                    try:
-                        rare_chance = float(data["rare_chance"])
-                    except (TypeError, ValueError) as exc:
-                        raise ValueError(
-                            "Rare chance must be between 0 and 100."
-                        ) from exc
-
-                    if not math.isfinite(rare_chance) or not 0 <= rare_chance <= 100:
-                        raise ValueError(
-                            "Rare chance must be between 0 and 100."
-                        )
-                    location["rare_chance"] = rare_chance
+                    location["rare_chance"] = _percentage(
+                        data["rare_chance"],
+                        "Rare catch chance",
+                        allow_zero=True,
+                    )
 
                 await self.cog.config.locations.set(locations)
 
             return web.json_response({"ok": True})
-
         except (ValueError, TypeError, KeyError) as exc:
             return web.json_response({"error": str(exc)}, status=400)
 
@@ -456,7 +395,6 @@ class FishingDashboard:
 
         async with self.cog._state_lock:
             locations = await self.cog.config.locations()
-            collections = await self.cog.config.collections()
 
             if key not in locations:
                 return web.json_response(
@@ -469,17 +407,13 @@ class FishingDashboard:
                     status=400,
                 )
 
-            label = locations[key]["label"]
             del locations[key]
-            collections.pop(key, None)
-
             await self.cog.config.locations.set(locations)
-            await self.cog.config.collections.set(collections)
 
-        return web.json_response({"ok": True, "deleted": label})
+        # Collections are global and deliberately are not deleted with locations.
+        return web.json_response({"ok": True})
 
     async def add_entry(self, request):
-        """Add an entry at a percentage and rescale other table entries."""
         key = request.match_info["key"]
 
         try:
@@ -492,21 +426,17 @@ class FishingDashboard:
 
             if rarity not in {"common", "rare"}:
                 raise ValueError("Rarity must be common or rare.")
-
             if nothing:
                 name = "Nothing"
                 description = ""
             elif not name or len(name) > 80:
                 raise ValueError("Fish name must be 1–80 characters.")
             elif name.casefold() == "nothing":
-                raise ValueError(
-                    "Select the Nothing option for a no-catch entry."
-                )
+                raise ValueError("Use the Nothing option for a no-catch entry.")
 
             async with self.cog._state_lock:
                 locations = await self.cog.config.locations()
                 location = locations.get(key)
-
                 if location is None:
                     return web.json_response(
                         {"error": "Location not found."},
@@ -514,12 +444,9 @@ class FishingDashboard:
                     )
 
                 table = location[rarity]
-
-                if any(
-                    str(entry.get("name", "")).casefold() == name.casefold()
-                    for entry in table
-                ):
-                    raise ValueError("That entry is already in this table.")
+                if any(str(entry.get("name", "")).casefold() == name.casefold()
+                       for entry in table):
+                    raise ValueError("That entry already exists in this table.")
                 if len(table) >= 100:
                     raise ValueError("This table already has 100 entries.")
 
@@ -527,14 +454,12 @@ class FishingDashboard:
                     if rate >= 100:
                         raise ValueError(
                             "When adding to a non-empty table, the new rate "
-                            "must be less than 100%."
+                            "must be below 100%."
                         )
-
-                    old_total = sum(float(entry["weight"]) for entry in table)
+                    total = sum(float(entry["weight"]) for entry in table)
                     remaining = 100.0 - rate
-
                     for entry in table:
-                        old_rate = float(entry["weight"]) * 100.0 / old_total
+                        old_rate = float(entry["weight"]) * 100.0 / total
                         entry["weight"] = old_rate * remaining / 100.0
                 else:
                     rate = 100.0
@@ -543,31 +468,27 @@ class FishingDashboard:
                 if nothing:
                     new_entry["type"] = "nothing"
                 table.append(new_entry)
-
                 await self.cog.config.locations.set(locations)
 
-                if description and not nothing:
-                    descriptions = await self.cog.config.fish_descriptions()
-                    descriptions[name.casefold()] = description
-                    await self.cog.config.fish_descriptions.set(descriptions)
+                if not nothing:
+                    await self.cog.add_catalog_names([name])
+                    if description:
+                        descriptions = await self.cog.config.fish_descriptions()
+                        descriptions[name.casefold()] = description
+                        await self.cog.config.fish_descriptions.set(descriptions)
 
             return web.json_response({"ok": True})
-
         except (ValueError, TypeError, KeyError) as exc:
             return web.json_response({"error": str(exc)}, status=400)
 
     async def update_entry(self, request):
-        """Set one entry's percentage and scale the other entries."""
         key = request.query.get("key", "")
         rarity = request.query.get("rarity", "").lower()
         name = request.query.get("name", "")
 
         try:
             data = await request.json()
-            new_rate = _percentage(
-                data.get("rate_percent"),
-                "Rarity percentage",
-            )
+            new_rate = _percentage(data.get("rate_percent"), "Rarity percentage")
 
             if rarity not in {"common", "rare"}:
                 raise ValueError("Rarity must be common or rare.")
@@ -575,7 +496,6 @@ class FishingDashboard:
             async with self.cog._state_lock:
                 locations = await self.cog.config.locations()
                 location = locations.get(key)
-
                 if location is None:
                     return web.json_response(
                         {"error": "Location not found."},
@@ -584,14 +504,10 @@ class FishingDashboard:
 
                 table = location[rarity]
                 target = next(
-                    (
-                        entry for entry in table
-                        if str(entry.get("name", "")).casefold()
-                        == name.casefold()
-                    ),
+                    (entry for entry in table
+                     if str(entry.get("name", "")).casefold() == name.casefold()),
                     None,
                 )
-
                 if target is None:
                     return web.json_response(
                         {"error": "Table entry not found."},
@@ -599,26 +515,18 @@ class FishingDashboard:
                     )
 
                 others = [entry for entry in table if entry is not target]
-
                 if not others:
                     if not math.isclose(new_rate, 100.0, abs_tol=0.0001):
-                        raise ValueError(
-                            "The only entry in a table must have a 100% rate."
-                        )
+                        raise ValueError("The only entry must have a 100% rate.")
                     target["weight"] = 100.0
                 else:
                     if new_rate >= 100:
                         raise ValueError(
                             "An entry cannot be 100% while other entries remain."
                         )
-
                     other_total = sum(float(entry["weight"]) for entry in others)
-                    if not math.isfinite(other_total) or other_total <= 0:
-                        raise ValueError("Other table entries have invalid rates.")
-
                     remaining = 100.0 - new_rate
                     target["weight"] = new_rate
-
                     for entry in others:
                         entry["weight"] = (
                             float(entry["weight"]) * remaining / other_total
@@ -627,12 +535,10 @@ class FishingDashboard:
                 await self.cog.config.locations.set(locations)
 
             return web.json_response({"ok": True})
-
         except (ValueError, TypeError, KeyError) as exc:
             return web.json_response({"error": str(exc)}, status=400)
 
     async def delete_entry(self, request):
-        """Remove an entry and normalize the remaining entries to 100%."""
         key = request.query.get("key", "")
         rarity = request.query.get("rarity", "").lower()
         name = request.query.get("name", "")
@@ -646,7 +552,6 @@ class FishingDashboard:
         async with self.cog._state_lock:
             locations = await self.cog.config.locations()
             location = locations.get(key)
-
             if location is None:
                 return web.json_response(
                     {"error": "Location not found."},
@@ -655,14 +560,10 @@ class FishingDashboard:
 
             table = location[rarity]
             target = next(
-                (
-                    entry for entry in table
-                    if str(entry.get("name", "")).casefold()
-                    == name.casefold()
-                ),
+                (entry for entry in table
+                 if str(entry.get("name", "")).casefold() == name.casefold()),
                 None,
             )
-
             if target is None:
                 return web.json_response(
                     {"error": "Table entry not found."},
@@ -676,13 +577,6 @@ class FishingDashboard:
 
             table.remove(target)
             total = sum(float(entry["weight"]) for entry in table)
-
-            if not math.isfinite(total) or total <= 0:
-                return web.json_response(
-                    {"error": "Remaining entries have invalid rates."},
-                    status=400,
-                )
-
             for entry in table:
                 entry["weight"] = float(entry["weight"]) * 100.0 / total
 
@@ -699,21 +593,46 @@ class FishingDashboard:
             if not name or len(name) > 80:
                 raise ValueError("Fish name must be 1–80 characters.")
             if name.casefold() == "nothing":
-                raise ValueError("Nothing outcomes cannot have descriptions.")
+                raise ValueError("Nothing cannot have a description.")
 
             async with self.cog._state_lock:
                 descriptions = await self.cog.config.fish_descriptions()
-                key = name.casefold()
-
                 if description:
-                    descriptions[key] = description
+                    descriptions[name.casefold()] = description
                 else:
-                    descriptions.pop(key, None)
-
+                    descriptions.pop(name.casefold(), None)
                 await self.cog.config.fish_descriptions.set(descriptions)
 
             return web.json_response({"ok": True})
+        except (ValueError, TypeError, KeyError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
 
+    async def create_collection(self, request):
+        try:
+            data = await request.json()
+            name = str(data.get("name", "")).strip()
+
+            if not name or len(name) > 80:
+                raise ValueError("Collection name must be 1–80 characters.")
+
+            key = _location_key(name)
+            if not key:
+                raise ValueError("Collection name must contain letters or numbers.")
+
+            async with self.cog._state_lock:
+                collections = await self.cog.config.collections()
+                if key in collections:
+                    raise ValueError("A collection with that name already exists.")
+
+                collections[key] = {
+                    "name": name,
+                    "enabled": False,
+                    "fish": [],
+                    "prompt": DEFAULT_COLLECTION_PROMPT,
+                }
+                await self.cog.config.collections.set(collections)
+
+            return web.json_response({"ok": True, "key": key})
         except (ValueError, TypeError, KeyError) as exc:
             return web.json_response({"error": str(exc)}, status=400)
 
@@ -722,27 +641,28 @@ class FishingDashboard:
 
         try:
             data = await request.json()
+            name = str(data.get("name", "")).strip()
             enabled = data.get("enabled")
-            fish = _clean_collection_fish(data.get("fish", []))
-            prompt = _clean_collection_prompt(data.get("prompt", ""))
+            fish = _clean_fish_list(data.get("fish", []))
+            prompt = _clean_prompt(data.get("prompt", ""))
 
+            if not name or len(name) > 80:
+                raise ValueError("Collection name must be 1–80 characters.")
             if not isinstance(enabled, bool):
-                raise ValueError("Collection enabled must be true or false.")
+                raise ValueError("Enabled must be true or false.")
             if enabled and not fish:
-                raise ValueError(
-                    "An enabled collection needs at least one required fish."
-                )
+                raise ValueError("An enabled collection needs at least one fish.")
 
             async with self.cog._state_lock:
-                locations = await self.cog.config.locations()
-                if key not in locations:
+                collections = await self.cog.config.collections()
+                if key not in collections:
                     return web.json_response(
-                        {"error": "Location not found."},
+                        {"error": "Collection not found."},
                         status=404,
                     )
 
-                collections = await self.cog.config.collections()
                 collections[key] = {
+                    "name": name,
                     "enabled": enabled,
                     "fish": fish,
                     "prompt": prompt,
@@ -750,9 +670,23 @@ class FishingDashboard:
                 await self.cog.config.collections.set(collections)
 
             return web.json_response({"ok": True})
-
         except (ValueError, TypeError, KeyError) as exc:
             return web.json_response({"error": str(exc)}, status=400)
+
+    async def delete_collection(self, request):
+        key = request.match_info["key"]
+
+        async with self.cog._state_lock:
+            collections = await self.cog.config.collections()
+            if key not in collections:
+                return web.json_response(
+                    {"error": "Collection not found."},
+                    status=404,
+                )
+            del collections[key]
+            await self.cog.config.collections.set(collections)
+
+        return web.json_response({"ok": True})
 
     async def upload_avatar(self, request):
         try:
@@ -765,35 +699,33 @@ class FishingDashboard:
             if not hasattr(image_field, "file"):
                 raise ValueError("Choose an image file.")
 
-            raw_image = image_field.file.read(MAX_IMAGE_BYTES + 1)
-            if len(raw_image) > MAX_IMAGE_BYTES:
+            raw = image_field.file.read(MAX_IMAGE_BYTES + 1)
+            if len(raw) > MAX_IMAGE_BYTES:
                 raise ValueError("Image must be 10 MB or smaller.")
-            if not raw_image:
-                raise ValueError("The selected image is empty.")
+            if not raw:
+                raise ValueError("Selected image is empty.")
 
             from PIL import Image
 
-            with Image.open(io.BytesIO(raw_image)) as image:
+            with Image.open(io.BytesIO(raw)) as image:
                 if image.size != (512, 512):
-                    raise ValueError("Avatar image must be exactly 512×512 pixels.")
+                    raise ValueError("Avatar image must be exactly 512×512.")
                 image.verify()
 
-            with Image.open(io.BytesIO(raw_image)) as image:
-                normalized = image.convert("RGBA")
+            with Image.open(io.BytesIO(raw)) as image:
                 output = io.BytesIO()
-                normalized.save(output, format="PNG")
+                image.convert("RGBA").save(output, format="PNG")
 
             AVATAR_DIR.mkdir(parents=True, exist_ok=True)
             slug = _slug(fish_name)
             filename = f"{slug}.png"
             target = AVATAR_DIR / filename
             temporary = AVATAR_DIR / f".{slug}.tmp.png"
-
             temporary.write_bytes(output.getvalue())
             temporary.replace(target)
 
+            await self.cog.add_catalog_names([fish_name])
             return web.json_response({"ok": True, "filename": filename})
-
         except (ValueError, TypeError, OSError) as exc:
             return web.json_response({"error": str(exc)}, status=400)
         except Exception:
@@ -810,529 +742,429 @@ DASHBOARD_HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>LokFishing Dashboard</title>
 <style>
-  body {font:16px system-ui,sans-serif;max-width:1100px;margin:2rem auto;padding:0 1rem;background:#101923;color:#edf4fa}
-  input,select,button,textarea {font:inherit;padding:.55rem;margin:.2rem;border-radius:6px;border:1px solid #526577}
-  button {cursor:pointer;background:#287bb5;color:white}
-  input,select,textarea {background:#182632;color:white}
-  textarea {box-sizing:border-box;width:100%;min-height:75px;resize:vertical}
-  section,.card {background:#17232e;padding:1rem;margin:1rem 0;border-radius:10px}
-  .row {display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
-  table {border-collapse:collapse;width:100%;margin:.5rem 0}
-  td,th {text-align:left;padding:.5rem;border-bottom:1px solid #40505e;vertical-align:top}
-  .small {color:#aebdca}
-  .danger {background:#a83d46}
-  .fish-icon {width:36px;height:36px;object-fit:cover;border-radius:6px;vertical-align:middle;margin-right:.5rem;background:#263746}
-  .description-editor {min-width:220px}
-  #error,#loginError {color:#ff9b9b;white-space:pre-wrap}
-  #status {color:#a9e6b0}
+body{font:16px system-ui,sans-serif;max-width:1100px;margin:2rem auto;padding:0 1rem;background:#101923;color:#edf4fa}
+input,select,button,textarea{font:inherit;padding:.55rem;margin:.2rem;border-radius:6px;border:1px solid #526577}
+button{cursor:pointer;background:#287bb5;color:white}
+input,select,textarea{background:#182632;color:white}
+textarea{box-sizing:border-box;width:100%;min-height:75px;resize:vertical}
+section,.card{background:#17232e;padding:1rem;margin:1rem 0;border-radius:10px}
+.row{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
+table{border-collapse:collapse;width:100%;margin:.5rem 0}
+td,th{text-align:left;padding:.5rem;border-bottom:1px solid #40505e;vertical-align:top}
+.small{color:#aebdca}
+.danger{background:#a83d46}
+.fish-icon{width:36px;height:36px;object-fit:cover;border-radius:6px;vertical-align:middle;margin-right:.5rem;background:#263746}
+.description-editor{min-width:220px}
+#error,#loginError{color:#ff9b9b;white-space:pre-wrap}
+#status{color:#a9e6b0}
 </style>
 </head>
 <body>
 <h1>LokFishing Dashboard</h1>
-<p class="small">Manage bait settings, locations, rarity percentages, fish lore, avatars, and collections.</p>
+<p class="small">Manage bait, locations, table percentages, fish, avatars, and global collections.</p>
 
 <div id="login" class="card">
-  <label>Dashboard password
-    <input id="password" type="password" autocomplete="current-password">
-  </label>
-  <button id="loginButton">Connect</button>
-  <p id="loginError"></p>
+<label>Dashboard password <input id="password" type="password" autocomplete="current-password"></label>
+<button id="loginButton">Connect</button><p id="loginError"></p>
 </div>
 
 <main id="app" hidden>
-  <p id="error"></p>
-  <p id="status"></p>
+<p id="error"></p><p id="status"></p>
 
-  <section>
-    <h2>Bait settings</h2>
-    <p class="small">These apply per player across all fishing locations. A Nothing result uses one cast.</p>
-    <div class="row">
-      <label>Casts per bait
-        <input id="castsPerBait" type="number" min="1" max="100" step="1">
-      </label>
-      <label>Cooldown after bait is used (seconds; 0 disables it)
-        <input id="baitCooldown" type="number" min="0" max="86400" step="1">
-      </label>
-      <button id="saveBaitSettings">Save bait settings</button>
-    </div>
-  </section>
+<section>
+<h2>Bait settings</h2>
+<p class="small">Per-player across all locations. A Nothing outcome uses a cast.</p>
+<div class="row">
+<label>Casts per bait <input id="castsPerBait" type="number" min="1" max="100"></label>
+<label>Reload cooldown, seconds <input id="baitCooldown" type="number" min="0" max="86400"></label>
+<button id="saveBait">Save bait settings</button>
+</div>
+</section>
 
-  <section>
-    <h2>Locations</h2>
-    <div class="row">
-      <select id="locationSelect"></select>
-      <input id="labelInput" placeholder="Location label">
-      <label>Rare catch chance %
-        <input id="rareInput" type="number" min="0" max="100" step="0.1">
-      </label>
-      <button id="saveLocation">Save location settings</button>
-      <button id="deleteLocation" class="danger">Delete location</button>
-    </div>
-  </section>
+<section>
+<h2>Locations</h2>
+<div class="row">
+<select id="locationSelect"></select>
+<input id="labelInput" placeholder="Location label">
+<label>Rare catch chance % <input id="rareInput" type="number" min="0" max="100" step="0.1"></label>
+<button id="saveLocation">Save location</button>
+<button id="deleteLocation" class="danger">Delete location</button>
+</div>
+</section>
 
-  <section>
-    <h2>Drop tables</h2>
-    <p class="small">
-      Entry percentages are within the Common or Rare table and total 100%.
-      Editing one entry proportionally adjusts the other entries.
-    </p>
-    <div id="tables"></div>
+<section>
+<h2>Drop tables</h2>
+<p class="small">Percentages are within the selected table and total 100%. Editing one scales the others.</p>
+<div id="tables"></div>
+<h3>Add fish to this location's table</h3>
+<div class="row">
+<select id="rarity"><option value="common">Common</option><option value="rare">Rare</option></select>
+<select id="fishSelect"></select>
+<input id="customFish" placeholder="Or type a new fish name">
+<label>Rarity % <input id="newRate" type="number" min="0.01" max="100" step="0.01" value="10"></label>
+<label><input id="nothing" type="checkbox"> Nothing</label>
+</div>
+<label>Optional lore description</label>
+<textarea id="newDescription" maxlength="1000" placeholder="Blank uses the basic catch message."></textarea>
+<button id="addEntry">Add entry</button>
+</section>
 
-    <h3>Add table entry</h3>
-    <div class="row">
-      <select id="rarity">
-        <option value="common">Common</option>
-        <option value="rare">Rare</option>
-      </select>
-      <input id="fishName" placeholder="Fish name">
-      <select id="avatarLibrary">
-        <option value="">Choose fish from image library…</option>
-      </select>
-      <label>Chance within table %
-        <input id="rate" type="number" min="0.01" max="100" step="0.01" value="10">
-      </label>
-      <label><input id="nothing" type="checkbox"> Nothing / no catch</label>
-    </div>
-    <label for="newFishDescription">Optional fish lore description</label>
-    <textarea id="newFishDescription" maxlength="1000"
-      placeholder="Leave blank for the basic catch message."></textarea>
-    <button id="addEntry">Add entry</button>
-  </section>
+<section>
+<h2>Global fish collections</h2>
+<p class="small">Collections are independent of location. A player must own every listed fish. Available catalog fish can be added to drop tables later.</p>
+<div class="row">
+<select id="collectionSelect"></select>
+<input id="newCollectionName" placeholder="New collection name">
+<button id="createCollection">Create collection</button>
+<button id="deleteCollection" class="danger">Delete selected</button>
+</div>
+<div class="row">
+<label>Collection name <input id="collectionName"></label>
+<label><input id="collectionEnabled" type="checkbox"> Enabled</label>
+<select id="collectionFishSelect"></select>
+<button id="addCollectionFish">Add selected fish</button>
+</div>
+<label>Required fish, one per line</label>
+<textarea id="collectionFish"></textarea>
+<label>Completion prompt. Tokens: {user}, {collection}</label>
+<textarea id="collectionPrompt" maxlength="1500"></textarea>
+<button id="saveCollection">Save collection</button>
+</section>
 
-  <section>
-    <h2>Collection for this location</h2>
-    <label><input id="collectionEnabled" type="checkbox"> Enable this collection</label>
-    <p class="small">Enter required fish one per line.</p>
-    <label for="collectionFish">Required fish</label>
-    <textarea id="collectionFish" placeholder="One fish name per line"></textarea>
-    <p id="collectionSuggestions" class="small"></p>
-    <label for="collectionPrompt">Completion prompt (tokens: {user}, {collection}, {location})</label>
-    <textarea id="collectionPrompt" maxlength="1500"></textarea>
-    <button id="saveCollection">Save collection</button>
-  </section>
+<section>
+<h2>Upload avatar / add catalog fish</h2>
+<p class="small">512×512 images are saved locally, not to GitHub. Catalog entries are not automatically added to drops.</p>
+<div class="row">
+<input id="avatarName" placeholder="Fish name">
+<input id="avatarFile" type="file" accept="image/png,image/jpeg,image/webp">
+<button id="uploadAvatar">Upload avatar</button>
+</div>
+<h3>Fish catalog</h3><div id="catalogList"></div>
+</section>
 
-  <section>
-    <h2>Upload avatar</h2>
-    <p class="small">Upload a square 512×512 image. It stays in the local avatar folder.</p>
-    <div class="row">
-      <input id="avatarName" placeholder="Fish name">
-      <input id="avatarFile" type="file" accept="image/png,image/jpeg,image/webp">
-      <button id="uploadAvatar">Upload / replace avatar</button>
-    </div>
-  </section>
+<section>
+<h2>Add location</h2>
+<div class="row">
+<input id="newLocationLabel" placeholder="Location name">
+<label>Rare chance % <input id="newLocationRare" type="number" min="0" max="100" step="0.1" value="5"></label>
+<select id="initialCommon"></select>
+<select id="initialRare"></select>
+<button id="createLocation">Create location</button>
+</div>
+</section>
 
-  <section>
-    <h2>Add location</h2>
-    <div class="row">
-      <input id="newLabel" placeholder="Location name">
-      <label>Rare catch chance %
-        <input id="newRare" type="number" min="0" max="100" step="0.1" value="5">
-      </label>
-      <input id="newCommon" placeholder="Initial common fish">
-      <input id="newRareFish" placeholder="Initial rare fish">
-      <button id="createLocation">Create location</button>
-    </div>
-  </section>
-
-  <button id="logout" class="danger">Log out</button>
+<button id="logout" class="danger">Log out</button>
 </main>
 
 <script>
 "use strict";
-let token = sessionStorage.getItem("lokfishing-token") || "";
-let state = null;
-const $ = id => document.getElementById(id);
+let token=sessionStorage.getItem("lokfishing-token")||"";
+let state=null;
+const $=id=>document.getElementById(id);
 
-function showError(message = "") {
-  $("error").textContent = message;
-  $("loginError").textContent = message;
-  $("status").textContent = "";
-}
-function showStatus(message = "") {
-  $("status").textContent = message;
-  $("error").textContent = "";
-  $("loginError").textContent = "";
-}
-async function api(url, options = {}) {
-  const headers = new Headers(options.headers || {});
-  headers.set("Authorization", "Bearer " + token);
-  let body = options.body;
-  if (body && !(body instanceof FormData)) {
-    headers.set("Content-Type", "application/json");
-    body = JSON.stringify(body);
-  }
-  const response = await fetch(url, {...options, headers, body});
-  const data = await response.json().catch(() => ({error: response.statusText}));
-  if (!response.ok) throw new Error(data.error || response.statusText);
+function error(message=""){ $("error").textContent=message; $("loginError").textContent=message; $("status").textContent=""; }
+function status(message=""){ $("status").textContent=message; $("error").textContent=""; $("loginError").textContent=""; }
+function node(tag,value){const e=document.createElement(tag);e.textContent=value;return e;}
+
+async function api(url,options={}){
+  const headers=new Headers(options.headers||{});
+  headers.set("Authorization","Bearer "+token);
+  let body=options.body;
+  if(body&&!(body instanceof FormData)){headers.set("Content-Type","application/json");body=JSON.stringify(body);}
+  const response=await fetch(url,{...options,headers,body});
+  const data=await response.json().catch(()=>({error:response.statusText}));
+  if(!response.ok)throw new Error(data.error||response.statusText);
   return data;
 }
-function node(tag, value) {
-  const element = document.createElement(tag);
-  element.textContent = value;
-  return element;
-}
-async function loadAvatar(img, filename) {
-  try {
-    const response = await fetch("/api/avatar/" + encodeURIComponent(filename), {
-      headers: {Authorization: "Bearer " + token}
-    });
-    if (!response.ok) return;
-    const url = URL.createObjectURL(await response.blob());
-    img.onload = () => URL.revokeObjectURL(url);
-    img.onerror = () => URL.revokeObjectURL(url);
-    img.src = url;
-  } catch (error) {}
-}
-function populateAvatarLibrary() {
-  const select = $("avatarLibrary");
-  select.replaceChildren(new Option("Choose fish from image library…", ""));
-  for (const avatar of (state.avatars || [])) {
-    select.add(new Option(`${avatar.name} — ${avatar.filename}`, avatar.filename));
-  }
-}
-function collectionFor(key, location) {
-  const saved = (state.collections || {})[key];
-  if (saved) return saved;
-  return {
-    enabled: true,
-    fish: (location.common || [])
-      .filter(entry => entry.name.toLowerCase() !== "nothing")
-      .map(entry => entry.name),
-    prompt: ""
-  };
-}
-async function refresh() {
-  state = await api("/api/state");
 
-  $("castsPerBait").value = state.game_settings.casts_per_bait;
-  $("baitCooldown").value = state.game_settings.bait_cooldown_seconds;
-
-  const select = $("locationSelect");
-  const previous = select.value;
-  select.replaceChildren();
-
-  for (const [key, location] of Object.entries(state.locations)) {
-    select.add(new Option(location.label, key));
-  }
-  if (previous && state.locations[previous]) select.value = previous;
-
-  populateAvatarLibrary();
-  renderLocation();
+async function showImage(img,filename){
+  try{
+    const response=await fetch("/api/avatar/"+encodeURIComponent(filename),{headers:{Authorization:"Bearer "+token}});
+    if(!response.ok)return;
+    const url=URL.createObjectURL(await response.blob());
+    img.onload=()=>URL.revokeObjectURL(url);
+    img.onerror=()=>URL.revokeObjectURL(url);
+    img.src=url;
+  }catch(e){}
 }
-function renderCollection(key, location) {
-  const collection = collectionFor(key, location);
-  $("collectionEnabled").checked = collection.enabled !== false;
-  $("collectionFish").value = (collection.fish || []).join("\n");
-  $("collectionPrompt").value = collection.prompt || "";
 
-  const names = [];
-  const seen = new Set();
-  for (const rarity of ["common", "rare"]) {
-    for (const entry of (location[rarity] || [])) {
-      if (entry.name.toLowerCase() === "nothing") continue;
-      if (!seen.has(entry.name.toLowerCase())) {
-        names.push(entry.name);
-        seen.add(entry.name.toLowerCase());
-      }
+function fillSelect(select,items,placeholder){
+  select.replaceChildren(new Option(placeholder,""));
+  for(const item of items)select.add(new Option(item.name,item.name));
+}
+
+function renderCatalog(){
+  const root=$("catalogList");
+  root.replaceChildren();
+  for(const item of state.fish_catalog){
+    const line=document.createElement("div");
+    if(item.avatar){
+      const img=document.createElement("img");
+      img.className="fish-icon";img.alt=item.name;line.append(img);showImage(img,item.avatar);
     }
+    line.append(document.createTextNode(item.name));
+    root.append(line);
   }
-  $("collectionSuggestions").textContent = names.length
-    ? "Fish in this location's tables: " + names.join(", ")
-    : "No fish are currently in this location's tables.";
 }
-function renderLocation() {
-  if (!state) return;
-  const key = $("locationSelect").value;
-  const location = state.locations[key];
 
-  if (!location) {
-    $("tables").replaceChildren(node("p", "Select a location."));
+function renderCollections(){
+  const select=$("collectionSelect");
+  const previous=select.value;
+  select.replaceChildren(new Option("Select collection…",""));
+  for(const [key,c] of Object.entries(state.collections||{})){
+    select.add(new Option(c.name||key,key));
+  }
+  if(previous&&state.collections[previous])select.value=previous;
+
+  const fishOptions=state.fish_catalog.map(x=>({name:x.name}));
+  fillSelect($("collectionFishSelect"),fishOptions,"Add fish from catalog…");
+  renderSelectedCollection();
+}
+
+function renderSelectedCollection(){
+  const key=$("collectionSelect").value;
+  const collection=(state.collections||{})[key];
+  const has=Boolean(collection);
+  $("collectionName").disabled=!has;
+  $("collectionEnabled").disabled=!has;
+  $("collectionFish").disabled=!has;
+  $("collectionPrompt").disabled=!has;
+  $("saveCollection").disabled=!has;
+  $("deleteCollection").disabled=!has;
+
+  if(!collection){
+    $("collectionName").value="";
+    $("collectionEnabled").checked=false;
+    $("collectionFish").value="";
+    $("collectionPrompt").value="";
     return;
   }
+  $("collectionName").value=collection.name||key;
+  $("collectionEnabled").checked=collection.enabled!==false;
+  $("collectionFish").value=(collection.fish||[]).join("\n");
+  $("collectionPrompt").value=collection.prompt||"";
+}
 
-  $("labelInput").value = location.label;
-  $("rareInput").value = location.rare_chance;
-  renderCollection(key, location);
+async function refresh(){
+  state=await api("/api/state");
+  $("castsPerBait").value=state.game_settings.casts_per_bait;
+  $("baitCooldown").value=state.game_settings.bait_cooldown_seconds;
 
-  const root = $("tables");
+  const locSelect=$("locationSelect");
+  const prior=locSelect.value;
+  locSelect.replaceChildren();
+  for(const [key,loc] of Object.entries(state.locations))locSelect.add(new Option(loc.label,key));
+  if(prior&&state.locations[prior])locSelect.value=prior;
+
+  const catalog=state.fish_catalog||[];
+  fillSelect($("fishSelect"),catalog,"Choose catalog fish…");
+  fillSelect($("initialCommon"),catalog,"Choose initial common fish…");
+  fillSelect($("initialRare"),catalog,"Choose initial rare fish…");
+
+  renderCollections();
+  renderCatalog();
+  renderLocation();
+}
+
+function renderLocation(){
+  if(!state)return;
+  const key=$("locationSelect").value;
+  const loc=state.locations[key];
+  const root=$("tables");
   root.replaceChildren();
+  if(!loc){root.append(node("p","Select a location."));return;}
 
-  for (const rarity of ["common", "rare"]) {
-    root.append(node("h3", rarity[0].toUpperCase() + rarity.slice(1)));
-    const table = document.createElement("table");
-    const header = document.createElement("tr");
+  $("labelInput").value=loc.label;
+  $("rareInput").value=loc.rare_chance;
 
-    for (const title of ["Fish / outcome", "Lore description", "Rarity %", "Actions"]) {
-      header.append(node("th", title));
-    }
-    table.append(header);
-
-    for (const entry of (location[rarity] || [])) {
-      const row = document.createElement("tr");
-
-      const nameCell = document.createElement("td");
-      if (entry.avatar) {
-        const img = document.createElement("img");
-        img.className = "fish-icon";
-        img.alt = entry.name;
-        img.title = entry.name;
-        nameCell.append(img);
-        loadAvatar(img, entry.avatar);
+  for(const rarity of ["common","rare"]){
+    root.append(node("h3",rarity[0].toUpperCase()+rarity.slice(1)));
+    const table=document.createElement("table");
+    const header=document.createElement("tr");
+    for(const label of ["Fish","Lore description","Rarity %","Actions"])header.append(node("th",label));
+    table.append(header);    for(const entry of (loc[rarity]||[])){
+      const row=document.createElement("tr");
+      const nameCell=document.createElement("td");
+      if(entry.avatar){
+        const img=document.createElement("img");img.className="fish-icon";img.alt=entry.name;
+        nameCell.append(img);showImage(img,entry.avatar);
       }
-      nameCell.append(document.createTextNode(entry.name));
-      row.append(nameCell);
+      nameCell.append(document.createTextNode(entry.name));row.append(nameCell);
 
-      const descriptionCell = document.createElement("td");
-      const descriptionInput = document.createElement("textarea");
-      descriptionInput.maxLength = 1000;
-      descriptionInput.placeholder = "Optional lore; blank uses the basic catch message.";
-      descriptionInput.value = entry.description || "";
-
-      const saveDescription = node("button", "Save description");
-      saveDescription.onclick = async () => {
-        try {
-          await api("/api/fish-description", {
-            method: "PATCH",
-            body: {name: entry.name, description: descriptionInput.value}
-          });
-          await refresh();
-          showStatus(descriptionInput.value.trim()
-            ? "Fish description saved."
-            : "Description cleared.");
-        } catch (error) {
-          showError(error.message);
-        }
+      const descCell=document.createElement("td");
+      const desc=document.createElement("textarea");desc.maxLength=1000;
+      desc.value=entry.description||"";desc.placeholder="Optional lore; blank uses basic catch message.";
+      const saveDesc=node("button","Save description");
+      saveDesc.onclick=async()=>{
+        try{
+          await api("/api/fish-description",{method:"PATCH",body:{name:entry.name,description:desc.value}});
+          await refresh();status("Description saved.");
+        }catch(e){error(e.message);}
       };
-      descriptionCell.append(descriptionInput, saveDescription);
-      row.append(descriptionCell);
+      descCell.append(desc,saveDesc);row.append(descCell);
 
-      const rateCell = document.createElement("td");
-      const rateInput = document.createElement("input");
-      rateInput.type = "number";
-      rateInput.min = "0.01";
-      rateInput.max = "100";
-      rateInput.step = "0.01";
-      rateInput.value = Number(entry.rate_percent || 0).toFixed(2);
-      rateCell.append(rateInput);
-      row.append(rateCell);
+      const rateCell=document.createElement("td");
+      const rate=document.createElement("input");rate.type="number";rate.min="0.01";rate.max="100";rate.step="0.01";
+      rate.value=Number(entry.rate_percent||0).toFixed(2);rateCell.append(rate);row.append(rateCell);
 
-      const actions = document.createElement("td");
-      const saveRate = node("button", "Save %");
-      saveRate.onclick = async () => {
-        try {
-          const query = new URLSearchParams({key, rarity, name: entry.name});
-          await api("/api/entry?" + query, {
-            method: "PATCH",
-            body: {rate_percent: rateInput.value}
-          });
-          await refresh();
-          showStatus("Percentage saved; other entries were adjusted.");
-        } catch (error) {
-          showError(error.message);
-        }
+      const actions=document.createElement("td");
+      const saveRate=node("button","Save %");
+      saveRate.onclick=async()=>{
+        try{
+          const q=new URLSearchParams({key,rarity,name:entry.name});
+          await api("/api/entry?"+q,{method:"PATCH",body:{rate_percent:rate.value}});
+          await refresh();status("Rate saved; other entries were proportionally adjusted.");
+        }catch(e){error(e.message);}
       };
-
-      const remove = node("button", "Remove");
-      remove.className = "danger";
-      remove.onclick = async () => {
-        if (!confirm(`Remove ${entry.name} from the ${rarity} table?`)) return;
-        try {
-          const query = new URLSearchParams({key, rarity, name: entry.name});
-          await api("/api/entry?" + query, {method: "DELETE"});
-          await refresh();
-          showStatus("Entry removed; remaining percentages were adjusted.");
-        } catch (error) {
-          showError(error.message);
-        }
+      const remove=node("button","Remove");remove.className="danger";
+      remove.onclick=async()=>{
+        if(!confirm(`Remove ${entry.name} from ${rarity}?`))return;
+        try{
+          const q=new URLSearchParams({key,rarity,name:entry.name});
+          await api("/api/entry?"+q,{method:"DELETE"});
+          await refresh();status("Entry removed; remaining rates now total 100%.");
+        }catch(e){error(e.message);}
       };
-
-      actions.append(saveRate, remove);
-      row.append(actions);
-      table.append(row);
+      actions.append(saveRate,remove);row.append(actions);table.append(row);
     }
     root.append(table);
   }
 }
 
-$("loginButton").onclick = async () => {
-  token = $("password").value;
-  try {
+$("loginButton").onclick=async()=>{
+  token=$("password").value;
+  try{
+    await refresh();sessionStorage.setItem("lokfishing-token",token);
+    $("login").hidden=true;$("app").hidden=false;status("Connected.");
+  }catch(e){token="";error(e.message);}
+};
+$("password").addEventListener("keydown",e=>{if(e.key==="Enter")$("loginButton").click();});
+$("locationSelect").onchange=renderLocation;
+$("collectionSelect").onchange=renderSelectedCollection;
+
+$("saveBait").onclick=async()=>{
+  try{
+    await api("/api/game-settings",{method:"PATCH",body:{
+      casts_per_bait:$("castsPerBait").value,
+      bait_cooldown_seconds:$("baitCooldown").value
+    }});
+    await refresh();status("Bait settings saved.");
+  }catch(e){error(e.message);}
+};
+
+$("saveLocation").onclick=async()=>{
+  try{
+    const key=$("locationSelect").value;
+    await api("/api/locations/"+encodeURIComponent(key),{method:"PATCH",body:{
+      label:$("labelInput").value,rare_chance:$("rareInput").value
+    }});
+    await refresh();status("Location saved.");
+  }catch(e){error(e.message);}
+};
+
+$("deleteLocation").onclick=async()=>{
+  const key=$("locationSelect").value,loc=state.locations[key];
+  if(!loc||!confirm(`Delete location ${loc.label}? Global collections will remain.`))return;
+  try{
+    await api("/api/locations/"+encodeURIComponent(key),{method:"DELETE"});
+    await refresh();status("Location deleted.");
+  }catch(e){error(e.message);}
+};
+
+$("fishSelect").onchange=()=>{
+  if($("fishSelect").value)$("customFish").value=$("fishSelect").value;
+};
+
+$("addEntry").onclick=async()=>{
+  try{
+    const key=$("locationSelect").value;
+    const name=$("customFish").value.trim()||$("fishSelect").value;
+    await api("/api/locations/"+encodeURIComponent(key)+"/entries",{method:"POST",body:{
+      rarity:$("rarity").value,name,rate_percent:$("newRate").value,
+      description:$("newDescription").value,nothing:$("nothing").checked
+    }});
+    $("customFish").value="";$("newDescription").value="";$("nothing").checked=false;
+    await refresh();status("Drop-table entry added.");
+  }catch(e){error(e.message);}
+};
+
+$("createCollection").onclick=async()=>{
+  try{
+    await api("/api/collections",{method:"POST",body:{name:$("newCollectionName").value}});
+    $("newCollectionName").value="";
     await refresh();
-    sessionStorage.setItem("lokfishing-token", token);
-    $("login").hidden = true;
-    $("app").hidden = false;
-    showStatus("Connected.");
-  } catch (error) {
-    token = "";
-    showError(error.message);
-  }
-};
-$("password").addEventListener("keydown", event => {
-  if (event.key === "Enter") $("loginButton").click();
-});
-$("locationSelect").onchange = renderLocation;
-
-$("avatarLibrary").onchange = () => {
-  const filename = $("avatarLibrary").value;
-  const avatar = (state.avatars || []).find(item => item.filename === filename);
-  if (avatar) {
-    $("fishName").value = avatar.name;
-    $("avatarName").value = avatar.name;
-  }
+    const wanted=state.collections;
+    const match=Object.entries(wanted).find(([,c])=>c.name.toLowerCase()===($("newCollectionName").value||"").toLowerCase());
+    if(match)$("collectionSelect").value=match[0];
+    renderSelectedCollection();status("Collection created. Add its fish and save it.");
+  }catch(e){error(e.message);}
 };
 
-$("saveBaitSettings").onclick = async () => {
-  try {
-    const result = await api("/api/game-settings", {
-      method: "PATCH",
-      body: {
-        casts_per_bait: $("castsPerBait").value,
-        bait_cooldown_seconds: $("baitCooldown").value
-      }
-    });
-    await refresh();
-    showStatus(
-      `Saved: ${result.casts_per_bait} casts per bait; ` +
-      `${result.bait_cooldown_seconds} second cooldown.`
-    );
-  } catch (error) {
-    showError(error.message);
-  }
+$("addCollectionFish").onclick=()=>{
+  const selected=$("collectionFishSelect").value;
+  if(!selected)return;
+  const current=$("collectionFish").value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
+  if(!current.some(x=>x.toLowerCase()===selected.toLowerCase()))current.push(selected);
+  $("collectionFish").value=current.join("\n");
 };
 
-$("saveLocation").onclick = async () => {
-  try {
-    const key = $("locationSelect").value;
-    await api("/api/locations/" + encodeURIComponent(key), {
-      method: "PATCH",
-      body: {label: $("labelInput").value, rare_chance: $("rareInput").value}
-    });
-    await refresh();
-    showStatus("Location settings saved.");
-  } catch (error) {
-    showError(error.message);
-  }
+$("saveCollection").onclick=async()=>{
+  try{
+    const key=$("collectionSelect").value;
+    const fish=$("collectionFish").value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
+    await api("/api/collections/"+encodeURIComponent(key),{method:"PATCH",body:{
+      name:$("collectionName").value,
+      enabled:$("collectionEnabled").checked,
+      fish,
+      prompt:$("collectionPrompt").value
+    }});
+    await refresh();$("collectionSelect").value=key;renderSelectedCollection();
+    status("Global collection saved.");
+  }catch(e){error(e.message);}
 };
 
-$("deleteLocation").onclick = async () => {
-  const key = $("locationSelect").value;
-  const location = state.locations[key];
-  if (!location || !confirm(`Delete "${location.label}" and its tables?`)) return;
-
-  try {
-    await api("/api/locations/" + encodeURIComponent(key), {method: "DELETE"});
-    await refresh();
-    showStatus("Location deleted.");
-  } catch (error) {
-    showError(error.message);
-  }
+$("deleteCollection").onclick=async()=>{
+  const key=$("collectionSelect").value;
+  if(!key||!confirm("Delete this global collection?"))return;
+  try{
+    await api("/api/collections/"+encodeURIComponent(key),{method:"DELETE"});
+    await refresh();status("Collection deleted.");
+  }catch(e){error(e.message);}
 };
 
-$("addEntry").onclick = async () => {
-  try {
-    const key = $("locationSelect").value;
-    await api("/api/locations/" + encodeURIComponent(key) + "/entries", {
-      method: "POST",
-      body: {
-        rarity: $("rarity").value,
-        name: $("fishName").value,
-        rate_percent: $("rate").value,
-        description: $("newFishDescription").value,
-        nothing: $("nothing").checked
-      }
-    });
-    $("fishName").value = "";
-    $("newFishDescription").value = "";
-    $("nothing").checked = false;
-    await refresh();
-    showStatus("Entry added; other percentages were adjusted.");
-  } catch (error) {
-    showError(error.message);
-  }
+$("createLocation").onclick=async()=>{
+  try{
+    await api("/api/locations",{method:"POST",body:{
+      label:$("newLocationLabel").value,
+      rare_chance:$("newLocationRare").value,
+      common_fish:$("initialCommon").value,
+      rare_fish:$("initialRare").value
+    }});
+    $("newLocationLabel").value="";
+    await refresh();status("Location created.");
+  }catch(e){error(e.message);}
 };
 
-$("saveCollection").onclick = async () => {
-  try {
-    const key = $("locationSelect").value;
-    const fish = $("collectionFish").value
-      .split(/\r?\n/)
-      .map(name => name.trim())
-      .filter(Boolean);
-
-    await api("/api/collections/" + encodeURIComponent(key), {
-      method: "PATCH",
-      body: {
-        enabled: $("collectionEnabled").checked,
-        fish,
-        prompt: $("collectionPrompt").value
-      }
-    });
-    await refresh();
-    showStatus("Collection settings saved.");
-  } catch (error) {
-    showError(error.message);
-  }
+$("uploadAvatar").onclick=async()=>{
+  try{
+    const file=$("avatarFile").files[0];
+    if(!file)throw new Error("Choose an image first.");
+    const form=new FormData();
+    form.append("name",$("avatarName").value);form.append("image",file);
+    await api("/api/avatar",{method:"POST",body:form});
+    await refresh();status("Avatar added to the local fish catalog.");
+  }catch(e){error(e.message);}
 };
 
-$("createLocation").onclick = async () => {
-  try {
-    await api("/api/locations", {
-      method: "POST",
-      body: {
-        label: $("newLabel").value,
-        rare_chance: $("newRare").value,
-        common_fish: $("newCommon").value,
-        rare_fish: $("newRareFish").value
-      }
-    });
-    $("newLabel").value = "";
-    $("newCommon").value = "";
-    $("newRareFish").value = "";
-    await refresh();
-    showStatus("Location created.");
-  } catch (error) {
-    showError(error.message);
-  }
+$("logout").onclick=()=>{
+  sessionStorage.removeItem("lokfishing-token");token="";state=null;
+  $("app").hidden=true;$("login").hidden=false;$("password").value="";
+  error("");
 };
 
-$("uploadAvatar").onclick = async () => {
-  try {
-    const file = $("avatarFile").files[0];
-    if (!file) throw new Error("Choose an image file first.");
-
-    const form = new FormData();
-    form.append("name", $("avatarName").value);
-    form.append("image", file);
-
-    const result = await api("/api/avatar", {method: "POST", body: form});
-    await refresh();
-    $("avatarLibrary").value = result.filename;
-    $("fishName").value = $("avatarName").value.trim();
-    showStatus(`Avatar saved locally as ${result.filename}.`);
-  } catch (error) {
-    showError(error.message);
-  }
-};
-
-$("logout").onclick = () => {
-  sessionStorage.removeItem("lokfishing-token");
-  token = "";
-  state = null;
-  $("app").hidden = true;
-  $("login").hidden = false;
-  $("password").value = "";
-  showError("");
-};
-
-if (token) {
-  refresh().then(() => {
-    $("login").hidden = true;
-    $("app").hidden = false;
-    showStatus("Connected.");
-  }).catch(() => {
-    token = "";
-    sessionStorage.removeItem("lokfishing-token");
-  });
+if(token){
+  refresh().then(()=>{$("login").hidden=true;$("app").hidden=false;status("Connected.");})
+    .catch(()=>{token="";sessionStorage.removeItem("lokfishing-token");});
 }
 </script>
 </body>
