@@ -395,7 +395,7 @@ class LokFishing(commands.Cog):
                                 rare_chance,
                                 fish_name,
                             )
-                            amount = random.randint(1, 3)
+                            amount = 1 if rarity == "rare" else random.randint(1, 3)
 
                             user_config = self.config.user(interaction.user)
                             inventory = await user_config.inventory()
