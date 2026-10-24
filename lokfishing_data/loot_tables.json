@@ -1,0 +1,38 @@
+{
+  "south_pole": {
+    "label": "South Pole",
+    "rare_chance": 20.0,
+    "common": [
+      {"name": "Nothing", "weight": 50.0, "type": "nothing"},
+      {"name": "Icefish", "weight": 50.0}
+    ],
+    "rare": [
+      {"name": "Frozen Icefish", "weight": 90.0},
+      {"name": "Baby Korra", "weight": 10.0}
+    ]
+  },
+  "republic_city": {
+    "label": "Republic City",
+    "rare_chance": 8.0,
+    "common": [
+      {"name": "Canal Carp", "weight": 5.0},
+      {"name": "Harbor Bluegill", "weight": 3.0}
+    ],
+    "rare": [
+      {"name": "Lanternfin Koi", "weight": 2.0},
+      {"name": "Platinum Eel", "weight": 1.0}
+    ]
+  },
+  "pro_bending_arena": {
+    "label": "Pro Bending Arena",
+    "rare_chance": 12.0,
+    "common": [
+      {"name": "Arena Minnow", "weight": 5.0},
+      {"name": "Ringwater Carp", "weight": 3.0}
+    ],
+    "rare": [
+      {"name": "Champion's Goldfin", "weight": 2.0},
+      {"name": "Lightningstripe Eel", "weight": 1.0}
+    ]
+  }
+}
